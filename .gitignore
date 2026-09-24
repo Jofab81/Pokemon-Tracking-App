@@ -1,0 +1,12 @@
+# Ignore compiled Python files
+__pycache__/
+*.pyc
+
+# Ignore PyInstaller build folders and the executable
+build/
+dist/
+*.spec
+
+# Ignore your personal save files so you don't upload your hunt data!
+shiny_history.json
+current_hunt.json
