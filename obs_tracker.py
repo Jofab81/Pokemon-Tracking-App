@@ -5,8 +5,156 @@ from io import BytesIO
 from PIL import Image, ImageTk
 import json
 import os
+import threading
+import time
+import mss
+import numpy as np
+import cv2
+
+# Fix Windows High-DPI scaling
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except:
+    pass
 
 LAYOUT_FILE = "obs_layout.json"
+
+class RegionSelector:
+    """Interactive screen-crop tool with arrow-key precision nudging."""
+    def __init__(self, root, callback):
+        self.callback = callback
+        self.top = tk.Toplevel(root)
+        self.top.attributes("-fullscreen", True)
+        self.top.attributes("-alpha", 0.3)
+        self.top.config(cursor="cross")
+
+        self.canvas = tk.Canvas(self.top, cursor="cross", bg="grey", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+
+        self.top.bind("<Left>", lambda e: self.move_box(-2, 0))
+        self.top.bind("<Right>", lambda e: self.move_box(2, 0))
+        self.top.bind("<Up>", lambda e: self.move_box(0, -2))
+        self.top.bind("<Down>", lambda e: self.move_box(0, 2))
+        self.top.bind("<Return>", self.confirm_selection)
+        self.top.bind("<Escape>", lambda e: self.top.destroy())
+        
+        self.top.focus_set()
+
+        self.start_x = None
+        self.start_y = None
+        self.current_x2 = 0
+        self.current_y2 = 0
+        self.rect = None
+
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            sct_img = sct.grab(monitor)
+            self.bg_image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            self.bg_photo = ImageTk.PhotoImage(self.bg_image)
+            self.canvas.create_image(0, 0, image=self.bg_photo, anchor="nw")
+            
+        self.canvas.create_text(
+            root.winfo_screenwidth() // 2, 30,
+            text="Drag to select region | Use Arrow Keys to fine-tune position | Press ENTER to confirm | ESC to cancel",
+            fill="yellow", font=("Helvetica", 14, "bold"), tags="instruction"
+        )
+
+    def on_press(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+        self.current_x2 = event.x
+        self.current_y2 = event.y
+        if self.rect:
+            self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(self.start_x, self.start_y, self.current_x2, self.current_y2, outline='red', width=2)
+
+    def on_drag(self, event):
+        self.current_x2 = event.x
+        self.current_y2 = event.y
+        if self.rect:
+            self.canvas.coords(self.rect, self.start_x, self.start_y, self.current_x2, self.current_y2)
+
+    def on_release(self, event):
+        pass
+
+    def move_box(self, dx, dy):
+        if not self.rect: return
+        self.start_x += dx
+        self.start_y += dy
+        self.current_x2 += dx
+        self.current_y2 += dy
+        self.canvas.coords(self.rect, self.start_x, self.start_y, self.current_x2, self.current_y2)
+
+    def confirm_selection(self, event=None):
+        if not self.rect:
+            self.top.destroy()
+            return
+            
+        x1 = min(self.start_x, self.current_x2)
+        y1 = min(self.start_y, self.current_y2)
+        x2 = max(self.start_x, self.current_x2)
+        y2 = max(self.start_y, self.current_y2)
+        width = x2 - x1
+        height = y2 - y1
+        
+        region = {"top": y1, "left": x1, "width": width, "height": height}
+        self.top.destroy()
+        if width > 10 and height > 10:
+            self.callback(region)
+
+
+class AutoTrackerWorker:
+    """Background thread that monitors screen pixel changes with live console testing."""
+    def __init__(self, callback_function):
+        self.is_running = False
+        self.callback = callback_function
+        self.thread = None
+        self.region = {"top": 200, "left": 200, "width": 400, "height": 300}
+        self.threshold = 10 
+
+    def start_loop(self):
+        if not self.is_running:
+            self.is_running = True
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.thread.start()
+
+    def stop_loop(self):
+        self.is_running = False
+
+    def set_region(self, region):
+        if region:
+            self.region = region
+
+    def _capture_loop(self):
+        with mss.mss() as sct:
+            last_frame = None
+            while self.is_running:
+                try:
+                    img = np.array(sct.grab(self.region))
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+                    
+                    if last_frame is not None:
+                        diff = cv2.absdiff(gray, last_frame)
+                        changed_pixels = np.count_nonzero(diff > self.threshold)
+                        total_pixels = self.region["width"] * self.region["height"]
+                        
+                        print(f"[Auto-Tracker Test] Pixel Change Score: {changed_pixels} (Target needed: {int(total_pixels * 0.15)})")
+                        
+                        if changed_pixels > (total_pixels * 0.15):
+                            print("-> ENCOUNTER DETECTED! Incrementing counter...")
+                            self.callback()
+                            time.sleep(3) 
+                            
+                    last_frame = gray
+                except Exception as e:
+                    print(f"Auto-tracker error: {e}")
+                time.sleep(0.1)
+
 
 class OBSShinyTracker:
     def __init__(self, root):
@@ -14,7 +162,11 @@ class OBSShinyTracker:
         self.root.title("Shiny Tracker - OBS Overlay")
         self.root.geometry("600x400")
         
-        # --- Default Settings & Variables ---
+        # --- LiveSplit Behavior & Borderless Window ---
+        self.root.overrideredirect(True)      # Hides native title bar
+        self.root.attributes("-topmost", True)  # Forces app to stay on top constantly
+        
+        # --- Variables ---
         self.pokemon_var = tk.StringVar()
         self.encounters_var = tk.IntVar(value=0)
         self.odds_var = tk.StringVar(value="Odds: 1/4096")
@@ -28,12 +180,14 @@ class OBSShinyTracker:
         self.outline_color = "#000000" 
         self.bg_color = "#00ff00" 
         
-        # Image Containers
         self.base_pil_image = None
         self.current_sprite = None
         self.edit_mode = False
 
-        # --- The Canvas Engine ---
+        # --- Auto-Tracker Worker ---
+        self.auto_worker = AutoTrackerWorker(callback_function=self.increment)
+
+        # --- Canvas Engine ---
         self.canvas = tk.Canvas(self.root, bg=self.bg_color, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
@@ -66,8 +220,8 @@ class OBSShinyTracker:
         # --- Control Panel Window ---
         self.control_panel = tk.Toplevel(self.root)
         self.control_panel.title("Stream Control Panel")
-        self.control_panel.geometry("450x700")
-        self.control_panel.protocol("WM_DELETE_WINDOW", self.toggle_menu) 
+        self.control_panel.geometry("450x800")
+        self.control_panel.protocol("WM_DELETE_WINDOW", self.on_closing) 
         
         self.create_control_panel()
         self.load_layout()
@@ -84,7 +238,6 @@ class OBSShinyTracker:
         self.root.bind("<Tab>", self.toggle_menu)
         self.control_panel.bind("<Tab>", self.toggle_menu)
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.control_panel.deiconify()
 
     def create_outlined_text(self, x, y, text, font, text_color, tag):
@@ -113,6 +266,14 @@ class OBSShinyTracker:
         ttk.Button(ctrl_frame, text="-1", command=self.decrement, width=5).pack(side="left", padx=5)
         ttk.Button(ctrl_frame, text="+1 Encounter (Spacebar)", command=self.increment).pack(side="left", expand=True, fill="x", padx=5)
 
+        # Auto-Tracker Frame
+        auto_frame = ttk.LabelFrame(self.control_panel, text="Auto-Tracker (Screen Scraping Test)", padding=10)
+        auto_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Button(auto_frame, text="🎯 Select Screen Region to Watch", command=self.open_region_selector).pack(fill="x", pady=2)
+        self.auto_toggle_btn = ttk.Button(auto_frame, text="Start Auto-Tracker", command=self.toggle_auto_tracker)
+        self.auto_toggle_btn.pack(fill="x", pady=2)
+        ttk.Label(auto_frame, text="💡 Tip: Watch your Python console terminal to test live pixel scores!", font=("Helvetica", 8, "italic"), foreground="gray").pack(anchor="w", pady=2)
+
         # Boosts Frame
         boosts_frame = ttk.LabelFrame(self.control_panel, text="Active Boosts", padding=5)
         boosts_frame.pack(fill="x", padx=10, pady=5)
@@ -131,7 +292,6 @@ class OBSShinyTracker:
         
         self.transparent_bg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(settings_frame, text="Make Background 100% Invisible", variable=self.transparent_bg_var, command=self.update_transparency).pack(anchor="w", pady=(5,0))
-        ttk.Label(settings_frame, text="⚠️ Note: When invisible, use Edit Mode to click and drag!", font=("Helvetica", 8, "italic"), foreground="gray").pack(anchor="w", pady=(0,5))
 
         # Alpha Frame
         alpha_frame = ttk.LabelFrame(self.control_panel, text="Visibility Controls (Slide to 0 for invisible)", padding=10)
@@ -157,7 +317,25 @@ class OBSShinyTracker:
         slider = ttk.Scale(frame, from_=from_val, to=to_val, orient="horizontal", variable=variable, command=command)
         slider.pack(side="right", expand=True, fill="x")
 
-    # --- Edit Mode & Dragging ---
+    # --- Auto-Tracker Controls ---
+    def open_region_selector(self):
+        self.control_panel.withdraw()
+        RegionSelector(self.root, self.save_selected_region)
+
+    def save_selected_region(self, region):
+        self.control_panel.deiconify()
+        self.auto_worker.set_region(region)
+        messagebox.showinfo("Success", "Auto-tracker region set successfully!")
+
+    def toggle_auto_tracker(self):
+        if not self.auto_worker.is_running:
+            self.auto_worker.start_loop()
+            self.auto_toggle_btn.config(text="Stop Auto-Tracker (Running...)")
+        else:
+            self.auto_worker.stop_loop()
+            self.auto_toggle_btn.config(text="Start Auto-Tracker")
+
+    # --- Edit Mode & Window / Element Dragging ---
     def toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode
         if self.edit_mode:
@@ -181,16 +359,26 @@ class OBSShinyTracker:
     def on_drag_start(self, event):
         items = self.canvas.find_withtag("current")
         if not items:
-            self.drag_item = None
+            # Clicked empty space: Drag the whole window around the screen!
+            self.drag_item = "window"
+            self.drag_start_x = event.x_root
+            self.drag_start_y = event.y_root
             return
             
         tags = self.canvas.gettags(items[0])
         
-        if "drag_counter" in tags: self.drag_item = "drag_counter"
-        elif "drag_odds" in tags: self.drag_item = "drag_odds"
-        elif "drag_menu" in tags: self.drag_item = "drag_menu"
-        elif "drag_sprite" in tags: self.drag_item = "drag_sprite"
-        else: self.drag_item = None
+        if self.edit_mode:
+            if "drag_counter" in tags: self.drag_item = "drag_counter"
+            elif "drag_odds" in tags: self.drag_item = "drag_odds"
+            elif "drag_menu" in tags: self.drag_item = "drag_menu"
+            elif "drag_sprite" in tags: self.drag_item = "drag_sprite"
+            else: self.drag_item = None
+        else:
+            # If not in edit mode, clicking anywhere drags the entire window
+            self.drag_item = "window"
+            self.drag_start_x = event.x_root
+            self.drag_start_y = event.y_root
+            return
 
         self.drag_start_x = event.x
         self.drag_start_y = event.y
@@ -199,17 +387,29 @@ class OBSShinyTracker:
     def on_drag_motion(self, event):
         if not self.drag_item: return
         self.dragged = True
-        dx = event.x - self.drag_start_x
-        dy = event.y - self.drag_start_y
-        self.canvas.move(self.drag_item, dx, dy)
-        self.drag_start_x = event.x
-        self.drag_start_y = event.y
+        
+        if self.drag_item == "window":
+            # Move the entire application window across the screen
+            dx = event.x_root - self.drag_start_x
+            dy = event.y_root - self.drag_start_y
+            x = self.root.winfo_x() + dx
+            y = self.root.winfo_y() + dy
+            self.root.geometry(f"+{x}+{y}")
+            self.drag_start_x = event.x_root
+            self.drag_start_y = event.y_root
+        else:
+            dx = event.x - self.drag_start_x
+            dy = event.y - self.drag_start_y
+            self.canvas.move(self.drag_item, dx, dy)
+            self.drag_start_x = event.x
+            self.drag_start_y = event.y
 
     def on_drag_release(self, event):
         if self.drag_item == "drag_menu" and not self.dragged:
             self.toggle_menu()
         if self.edit_mode:
             self.update_edit_boxes()
+        self.drag_item = None
 
     def toggle_menu(self, event=None):
         if self.control_panel.winfo_ismapped():
@@ -322,7 +522,6 @@ class OBSShinyTracker:
         m_alpha = 1.0 if self.edit_mode else self.alpha_menu.get()
         s_alpha = 1.0 if self.edit_mode else self.alpha_sprite.get()
 
-        # COUNTER (Hidden completely if invisible)
         if c_alpha <= 0.01:
             self.canvas.itemconfig("drag_counter_main", state="hidden")
             self.canvas.itemconfig("drag_counter_shadow", state="hidden")
@@ -330,7 +529,6 @@ class OBSShinyTracker:
             self.canvas.itemconfig("drag_counter_main", state="normal", fill=self.blend_color(self.text_color, blend_bg, c_alpha))
             self.canvas.itemconfig("drag_counter_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, c_alpha))
 
-        # ODDS (Hidden completely if invisible)
         if o_alpha <= 0.01:
             self.canvas.itemconfig("drag_odds_main", state="hidden")
             self.canvas.itemconfig("drag_odds_shadow", state="hidden")
@@ -338,7 +536,6 @@ class OBSShinyTracker:
             self.canvas.itemconfig("drag_odds_main", state="normal", fill=self.blend_color(self.text_color, blend_bg, o_alpha))
             self.canvas.itemconfig("drag_odds_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, o_alpha))
 
-        # MENU BUTTON (Hidden completely if invisible)
         if m_alpha <= 0.01:
             self.canvas.itemconfig("drag_menu_main", state="hidden")
             self.canvas.itemconfig("drag_menu_shadow", state="hidden")
@@ -346,7 +543,6 @@ class OBSShinyTracker:
             self.canvas.itemconfig("drag_menu_main", state="normal", fill=self.blend_color("#ffffff", blend_bg, m_alpha))
             self.canvas.itemconfig("drag_menu_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, m_alpha))
 
-        # SPRITE (Hidden completely if invisible)
         if self.base_pil_image:
             if s_alpha <= 0.01:
                 self.canvas.itemconfig("drag_sprite_main", image="", state="hidden")
@@ -359,7 +555,6 @@ class OBSShinyTracker:
                 self.current_sprite = ImageTk.PhotoImage(img)
                 self.canvas.itemconfig("drag_sprite_main", image=self.current_sprite, state="normal")
 
-    # --- Layout Saving ---
     def move_group_to(self, main_tag, group_tag, new_x, new_y):
         curr = self.canvas.coords(main_tag)
         if curr and len(curr) >= 2:
@@ -391,9 +586,16 @@ class OBSShinyTracker:
             json.dump(layout, f)
 
     def on_closing(self):
+        self.auto_worker.stop_loop()
         self.save_layout()
-        self.root.destroy()
-        self.control_panel.destroy()
+        try:
+            self.root.destroy()
+        except:
+            pass
+        try:
+            self.control_panel.destroy()
+        except:
+            pass
 
     def load_layout(self):
         if os.path.exists(LAYOUT_FILE):
