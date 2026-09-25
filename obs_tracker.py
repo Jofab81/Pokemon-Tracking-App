@@ -170,9 +170,11 @@ class OBSShinyTracker:
         self.pokemon_var = tk.StringVar()
         self.encounters_var = tk.IntVar(value=0)
         self.odds_var = tk.StringVar(value="Odds: 1/4096")
-        self.base_odds_var = tk.StringVar(value="1/4096 (Gen 6+)")
         
-        # Size Controls (starting at 120 baseline, scaling up to 500)
+        # Expanded Odds Preset List
+        self.base_odds_var = tk.StringVar(value="Gen 6+ (1/4096 Standard)")
+        
+        # Size Controls
         self.size_sprite = tk.IntVar(value=120)
         self.size_counter = tk.IntVar(value=56)
         self.size_odds = tk.IntVar(value=16)
@@ -301,8 +303,17 @@ class OBSShinyTracker:
         ttk.Entry(setup_frame, textvariable=self.pokemon_var, width=15).grid(row=0, column=1, pady=5)
         ttk.Button(setup_frame, text="Load", command=self.load_pokemon).grid(row=0, column=2, padx=5)
         
-        ttk.Label(setup_frame, text="Base Odds:").grid(row=1, column=0, pady=5)
-        ttk.Combobox(setup_frame, textvariable=self.base_odds_var, values=["1/4096 (Gen 6+)", "1/8192 (Gen 1-5)"], state="readonly", width=15).grid(row=1, column=1, columnspan=2, sticky="w")
+        ttk.Label(setup_frame, text="Game / Method:").grid(row=1, column=0, pady=5)
+        
+        odds_presets = [
+            "Gen 6+ (1/4096 Standard)",
+            "Gen 1-5 (1/8192 Standard)",
+            "Dynamax Adventures (1/300)",
+            "Dynamax Adventures + Charm (1/100)",
+            "SV: Outbreak / Sandwich Hunt",
+            "Legends Arceus / Z-A: Outbreak/MMO"
+        ]
+        ttk.Combobox(setup_frame, textvariable=self.base_odds_var, values=odds_presets, state="readonly", width=20).grid(row=1, column=1, columnspan=2, sticky="w")
         
         ttk.Button(setup_frame, text="✨ Register Current as Caught!", command=self.register_caught).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5,5))
         
@@ -313,7 +324,7 @@ class OBSShinyTracker:
         self.caught_checkboxes_container = ttk.Frame(self.caught_mgr_frame)
         self.caught_checkboxes_container.pack(fill="x")
 
-        # Size Controls Frame (Sprite size range: 120 to 500)
+        # Size Controls Frame
         size_frame = ttk.LabelFrame(self.control_panel, text="Element Sizes", padding=10)
         size_frame.pack(fill="x", padx=10, pady=5)
         self.make_slider(size_frame, "Sprite Size:", self.size_sprite, 120, 500, None)
@@ -413,7 +424,6 @@ class OBSShinyTracker:
             )
             cb.pack(side="left", padx=2)
             
-            # Caught Pokémon size slider range: 120 to 500
             slider = ttk.Scale(
                 row,
                 from_=120,
@@ -658,12 +668,14 @@ class OBSShinyTracker:
         if self.edit_mode:
             self.update_edit_boxes()
         self.drag_item = None
+        self.save_layout()  # Auto-save immediately upon releasing dragged elements
 
     def on_caught_drag_release(self, event):
         if hasattr(self, 'caught_drag_item'):
             self.caught_drag_item = None
         if self.edit_mode:
             self.update_edit_boxes()
+        self.save_layout()  # Auto-save immediately upon releasing caught elements
 
     def toggle_menu(self, event=None):
         if self.control_panel.winfo_ismapped():
@@ -671,20 +683,37 @@ class OBSShinyTracker:
         else:
             self.control_panel.deiconify()
 
-    # --- Feature Logic ---
+    # --- Advanced Game-Specific Odds Calculation Engine ---
     def calculate_odds(self, *args):
-        base = 8192 if "8192" in self.base_odds_var.get() else 4096
-        rolls = 1 
-        if self.charm_var.get(): rolls += 2
-        if self.masuda_var.get(): rolls += 5 if base == 4096 else 4
-        if self.sandwich_var.get(): rolls += 3
-
-        final_odds = max(1, base / rolls)
-        self.odds_var.set(f"Odds: {rolls}/{base} (1/{final_odds:.0f})")
+        selection = self.base_odds_var.get()
         
+        if "Dynamax Adventures + Charm" in selection:
+            final_odds = 100
+            display_text = f"Odds: 1/{final_odds} (Dynamax Adv.)"
+        elif "Dynamax Adventures" in selection:
+            final_odds = 300
+            display_text = f"Odds: 1/{final_odds} (Dynamax Adv.)"
+        else:
+            base = 8192 if "8192" in selection else 4096
+            rolls = 1 
+            
+            if self.charm_var.get(): rolls += 2
+            if self.masuda_var.get(): rolls += 5 if base == 4096 else 4
+            if self.sandwich_var.get(): rolls += 3
+
+            if "SV: Outbreak" in selection:
+                rolls += 2 
+            elif "Legends Arceus" in selection:
+                rolls += 3 
+
+            final_odds = max(1, base / rolls)
+            display_text = f"Odds: {rolls}/{base} (1/{final_odds:.0f})"
+
+        self.odds_var.set(display_text)
         self.canvas.itemconfig("drag_odds_main", text=self.odds_var.get())
         self.canvas.itemconfig("drag_odds_shadow", text=self.odds_var.get())
         if self.edit_mode: self.update_edit_boxes()
+        self.save_layout()
 
     def load_pokemon(self):
         pokemon = self.pokemon_var.get().strip().lower()
@@ -702,6 +731,7 @@ class OBSShinyTracker:
                     self.base_pil_image = Image.open(BytesIO(img_resp.content)).resize((size, size), Image.Resampling.NEAREST)
                     self.update_transparency() 
                     if self.edit_mode: self.update_edit_boxes()
+                    self.save_layout()
                 else:
                     messagebox.showerror("Error", "No shiny sprite found for this Pokémon.")
             else:
@@ -714,6 +744,7 @@ class OBSShinyTracker:
         self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
         self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
         if self.edit_mode: self.update_edit_boxes()
+        self.save_layout()
 
     def decrement(self): 
         if self.encounters_var.get() > 0: 
@@ -721,25 +752,29 @@ class OBSShinyTracker:
             self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
             self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
             if self.edit_mode: self.update_edit_boxes()
+            self.save_layout()
 
     # --- Rendering & Transparency Math ---
     def change_text_color(self):
         color = colorchooser.askcolor(title="Choose Text Color", initialcolor=self.text_color)[1]
         if color:
             self.text_color = color
-            self.update_transparency() 
+            self.update_transparency()
+            self.save_layout()
 
     def change_outline_color(self):
         color = colorchooser.askcolor(title="Choose Outline Color", initialcolor=self.outline_color)[1]
         if color:
             self.outline_color = color
-            self.update_transparency() 
+            self.update_transparency()
+            self.save_layout()
 
     def change_bg_color(self):
         color = colorchooser.askcolor(title="Choose Background Color", initialcolor=self.bg_color)[1]
         if color:
             self.bg_color = color
-            self.update_transparency() 
+            self.update_transparency()
+            self.save_layout()
 
     def blend_color(self, hex_fg, hex_bg, alpha):
         if alpha <= 0.01: return hex_bg 
@@ -842,6 +877,14 @@ class OBSShinyTracker:
 
         layout = {
             "window_geometry": self.root.geometry(),
+            "hunt_state": {
+                "pokemon": self.pokemon_var.get(),
+                "encounters": self.encounters_var.get(),
+                "base_odds": self.base_odds_var.get(),
+                "charm": self.charm_var.get(),
+                "masuda": self.masuda_var.get(),
+                "sandwich": self.sandwich_var.get()
+            },
             "sizes": {
                 "sprite": self.size_sprite.get(),
                 "counter": self.size_counter.get(),
@@ -899,6 +942,21 @@ class OBSShinyTracker:
                     geom = data.get("window_geometry")
                     if geom:
                         self.root.geometry(geom)
+
+                    # Restore Hunt State
+                    hunt_state = data.get("hunt_state", {})
+                    self.pokemon_var.set(hunt_state.get("pokemon", ""))
+                    self.encounters_var.set(hunt_state.get("encounters", 0))
+                    self.base_odds_var.set(hunt_state.get("base_odds", "Gen 6+ (1/4096 Standard)"))
+                    self.charm_var.set(hunt_state.get("charm", False))
+                    self.masuda_var.set(hunt_state.get("masuda", False))
+                    self.sandwich_var.set(hunt_state.get("sandwich", False))
+
+                    self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
+                    self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
+
+                    if self.pokemon_var.get().strip():
+                        self.load_pokemon()
 
                     sizes = data.get("sizes", {})
                     self.size_sprite.set(sizes.get("sprite", 120))
