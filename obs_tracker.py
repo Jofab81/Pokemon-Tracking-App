@@ -10,6 +10,15 @@ import time
 import mss
 import numpy as np
 import cv2
+import wave
+
+# Audio Processing Libraries
+try:
+    import pyaudiowpatch as pyaudio
+    from scipy import signal
+    AUDIO_SUPPORTED = True
+except ImportError:
+    AUDIO_SUPPORTED = False
 
 # Fix Windows High-DPI scaling
 try:
@@ -19,6 +28,7 @@ except:
     pass
 
 LAYOUT_FILE = "obs_layout.json"
+SOUNDS_DIR = "sounds"
 
 class RegionSelector:
     """Interactive screen-crop tool with arrow-key precision nudging."""
@@ -108,8 +118,8 @@ class RegionSelector:
             self.callback(region)
 
 
-class AutoTrackerWorker:
-    """Background thread that uses a lockout timer to ignore post-battle fades."""
+class ScreenTrackerWorker:
+    """Background thread that uses screen brightness scraping."""
     def __init__(self, callback_function):
         self.is_running = False
         self.callback = callback_function
@@ -117,7 +127,7 @@ class AutoTrackerWorker:
         self.region = {"top": 200, "left": 200, "width": 400, "height": 300}
         self.brightness_threshold = 15
         self.last_encounter_time = 0
-        self.lockout_duration = 45.0 
+        self.lockout_duration = 30.0 
 
     def start_loop(self):
         if not self.is_running:
@@ -145,16 +155,220 @@ class AutoTrackerWorker:
                     
                     if is_black:
                         if (current_time - self.last_encounter_time) > self.lockout_duration:
-                            print("-> ENCOUNTER DETECTED! Incrementing counter...")
+                            print("-> ENCOUNTER DETECTED (Screen)! Incrementing counter...")
                             self.callback()
                             self.last_encounter_time = time.time()
                         else:
                             time.sleep(1)
 
                 except Exception as e:
-                    print(f"Auto-tracker error: {e}")
+                    print(f"Screen auto-tracker error: {e}")
                 
                 time.sleep(0.1)
+
+
+class AudioTrackerWorker:
+    """Background thread that listens to Windows Loopback audio using True Pearson Volume Matching."""
+    def __init__(self, callback_function):
+        self.is_running = False
+        self.callback = callback_function
+        self.thread = None
+        self.game_folder = ""
+        self.templates = []
+        self.match_threshold = 0.75  # Set to a true 75% match
+        self.last_encounter_time = 0
+        self.lockout_duration = 15.0
+
+    def get_system_sample_rate(self):
+        p = pyaudio.PyAudio()
+        try:
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            if not default_speakers["isLoopbackDevice"]:
+                for loopback in p.get_loopback_device_info_generator():
+                    if default_speakers["name"] in loopback["name"]:
+                        default_speakers = loopback
+                        break
+            rate = int(default_speakers["defaultSampleRate"])
+            return rate
+        except Exception:
+            return 48000 
+        finally:
+            p.terminate()
+
+    def get_envelope(self, audio_array, block_size=480):
+        """Converts raw audio into a volume shape (RMS Envelope)."""
+        trim_len = len(audio_array) - (len(audio_array) % block_size)
+        if trim_len == 0: return np.zeros(1)
+        trimmed = audio_array[:trim_len].astype(np.float32)
+        # Calculate Root-Mean-Square (RMS) to get the true volume over time
+        rms = np.sqrt(np.mean(trimmed.reshape(-1, block_size)**2, axis=1))
+        return rms
+
+    def compute_pearson_max(self, live_env, tmpl_env):
+        """Slides the template over the live audio and returns a true percentage match (0.0 to 1.0)."""
+        n_live = len(live_env)
+        n_tmpl = len(tmpl_env)
+        if n_tmpl > n_live or n_tmpl == 0:
+            return 0.0
+        
+        max_corr = -1.0
+        # Slide the template window across the 4-second live memory buffer
+        for i in range(n_live - n_tmpl + 1):
+            window = live_env[i : i + n_tmpl]
+            
+            # Pearson Correlation Math
+            w_centered = window - np.mean(window)
+            t_centered = tmpl_env - np.mean(tmpl_env)
+            
+            numerator = np.sum(w_centered * t_centered)
+            denominator = np.sqrt(np.sum(w_centered**2) * np.sum(t_centered**2))
+            
+            if denominator > 0:
+                corr = numerator / denominator
+                if corr > max_corr:
+                    max_corr = corr
+                    
+        return max_corr
+
+    def load_game_templates(self, game_folder_name):
+        self.game_folder = game_folder_name
+        self.templates = []
+        target_path = os.path.join(SOUNDS_DIR, game_folder_name)
+        if not os.path.exists(target_path):
+            return 0
+
+        target_rate = self.get_system_sample_rate()
+        print(f"-> System Target Sample Rate: {target_rate}Hz")
+
+        for file in os.listdir(target_path):
+            if file.lower().endswith(".wav"):
+                full_file = os.path.join(target_path, file)
+                try:
+                    with wave.open(full_file, 'rb') as wf:
+                        raw_data = wf.readframes(wf.getnframes())
+                        audio_data = np.frombuffer(raw_data, dtype=np.int16)
+                        if wf.getnchannels() == 2:
+                            audio_data = audio_data.reshape(-1, 2).mean(axis=1)
+                        
+                        original_rate = wf.getframerate()
+                        
+                        # Resample if Windows doesn't match the file
+                        if original_rate != target_rate:
+                            num_target_samples = int(len(audio_data) * target_rate / original_rate)
+                            audio_data = signal.resample(audio_data, num_target_samples)
+                        
+                        # Convert the raw sound into a volume shape
+                        envelope = self.get_envelope(audio_data)
+                        
+                        duration = len(audio_data) / target_rate
+                        print(f"Loaded {file} | Rate: {target_rate}Hz | Length: {duration:.2f}s")
+                        
+                        self.templates.append((file, envelope, target_rate))
+                except Exception as e:
+                    print(f"Failed to load audio template {file}: {e}")
+        return len(self.templates)
+
+    def start_loop(self):
+        if not AUDIO_SUPPORTED:
+            messagebox.showerror("Audio Error", "Please install pyaudiowpatch and scipy")
+            return False
+
+        if not self.templates:
+            messagebox.showwarning("No Templates", "No .wav audio clips found in the selected game folder!")
+            return False
+
+        if not self.is_running:
+            self.is_running = True
+            self.thread = threading.Thread(target=self._audio_loop, daemon=True)
+            self.thread.start()
+            return True
+        return False
+
+    def stop_loop(self):
+        self.is_running = False
+
+    def _audio_loop(self):
+        p = pyaudio.PyAudio()
+        try:
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            
+            if not default_speakers["isLoopbackDevice"]:
+                for loopback in p.get_loopback_device_info_generator():
+                    if default_speakers["name"] in loopback["name"]:
+                        default_speakers = loopback
+                        break
+
+            rate = int(default_speakers["defaultSampleRate"])
+            chunk_size = 4096 * 2  
+            
+            buffer_frames = rate * 4
+            rolling_buffer = np.zeros(buffer_frames, dtype=np.float32)
+
+            stream = p.open(format=pyaudio.paInt16,
+                            channels=default_speakers["maxInputChannels"],
+                            rate=rate,
+                            input=True,
+                            input_device_index=default_speakers["index"],
+                            frames_per_buffer=chunk_size)
+
+            print(f"-> Audio Tracker listening to: {default_speakers['name']} at {rate}Hz")
+            debug_timer = time.time()
+            highest_seen_score = 0.0  
+
+            while self.is_running:
+                data = stream.read(chunk_size, exception_on_overflow=False)
+                live_chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+
+                if default_speakers["maxInputChannels"] == 2:
+                    live_chunk = live_chunk.reshape(-1, 2).mean(axis=1)
+
+                rolling_buffer = np.roll(rolling_buffer, -len(live_chunk))
+                rolling_buffer[-len(live_chunk):] = live_chunk
+
+                max_val = np.max(np.abs(live_chunk))
+                
+                # Check if the game is making any noise at all
+                if max_val > 50: 
+                    # Convert live rolling buffer into volume envelope
+                    live_envelope = self.get_envelope(rolling_buffer)
+
+                    for name, tmpl_env, tmpl_rate in self.templates:
+                        if len(live_envelope) >= len(tmpl_env):
+                            
+                            # Run the true Pearson percentage match
+                            score = self.compute_pearson_max(live_envelope, tmpl_env)
+                            
+                            if score > highest_seen_score:
+                                highest_seen_score = score
+
+                            if score > self.match_threshold:
+                                now = time.time()
+                                if (now - self.last_encounter_time) > self.lockout_duration:
+                                    print(f"🔥 BINGO! MATCHED [{name}] WITH SCORE: {score:.2f} ({(score*100):.1f}%)! Incrementing counter...")
+                                    self.callback()
+                                    self.last_encounter_time = now
+                                    highest_seen_score = 0.0
+                                    break
+
+                # Print the highest score seen every 3 seconds
+                if time.time() - debug_timer > 3.0:
+                    print(f"[DEBUG] Best Pearson Match Score in last 3s: {highest_seen_score:.4f} ({(highest_seen_score*100):.1f}%)")
+                    debug_timer = time.time()
+                    highest_seen_score = 0.0
+
+                time.sleep(0.01)
+
+        except Exception as e:
+            print(f"Audio loop error: {e}")
+        finally:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except:
+                pass
+            p.terminate()
 
 
 class OBSShinyTracker:
@@ -170,16 +384,15 @@ class OBSShinyTracker:
         self.pokemon_var = tk.StringVar()
         self.encounters_var = tk.IntVar(value=0)
         self.odds_var = tk.StringVar(value="Odds: 1/4096")
-        
-        # Expanded Odds Preset List
         self.base_odds_var = tk.StringVar(value="Gen 6+ (1/4096 Standard)")
+        self.audio_game_var = tk.StringVar()
         
         # Size Controls
         self.size_sprite = tk.IntVar(value=120)
         self.size_counter = tk.IntVar(value=56)
         self.size_odds = tk.IntVar(value=16)
 
-        # Hotkey Config Variables
+        # Hotkeys
         self.key_inc = tk.StringVar(value="space")
         self.key_dec = tk.StringVar(value="Down")
         self.key_caught = tk.StringVar(value="c")
@@ -199,7 +412,7 @@ class OBSShinyTracker:
         
         self.caught_list = []
 
-        # --- Dedicated Full-Screen Transparent Caught Overlay Window ---
+        # --- Full-Screen Overlay Window ---
         self.caught_window = tk.Toplevel(self.root)
         self.caught_window.attributes("-fullscreen", True)
         self.caught_window.attributes("-topmost", True)
@@ -210,30 +423,27 @@ class OBSShinyTracker:
         self.caught_canvas = tk.Canvas(self.caught_window, bg=caught_magic_key, highlightthickness=0)
         self.caught_canvas.pack(fill="both", expand=True)
 
-        # --- Auto-Tracker Worker ---
-        self.auto_worker = AutoTrackerWorker(callback_function=self.increment)
+        # --- Workers ---
+        self.screen_worker = ScreenTrackerWorker(callback_function=self.increment)
+        self.audio_worker = AudioTrackerWorker(callback_function=self.increment)
 
         # --- Canvas Engine ---
         self.canvas = tk.Canvas(self.root, bg=self.bg_color, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
-        # 1. Sprite Group
+        # Elements
         self.canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=("drag_sprite", "drag_sprite_box", "edit_box"))
         self.canvas.create_image(150, 200, image="", tags=("drag_sprite", "drag_sprite_main"))
 
-        # 2. Counter Group
         self.canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=("drag_counter", "drag_counter_box", "edit_box"))
         self.create_outlined_text(350, 180, "0", ("Helvetica", 56, "bold"), self.text_color, "drag_counter")
 
-        # 3. Odds Group
         self.canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=("drag_odds", "drag_odds_box", "edit_box"))
         self.create_outlined_text(350, 260, "Odds: 1/4096", ("Helvetica", 16, "bold"), self.text_color, "drag_odds")
 
-        # 4. Menu Button Group
         self.canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=("drag_box_menu", "drag_menu_box", "edit_box"))
         self.create_outlined_text(80, 30, "⚙️ Menu (Tab)", ("Helvetica", 12, "bold"), "#ffffff", "drag_menu")
 
-        # --- Drag Variables ---
         self.drag_item = None
         self.drag_start_x = 0
         self.drag_start_y = 0
@@ -243,12 +453,11 @@ class OBSShinyTracker:
         self.canvas.bind("<B1-Motion>", self.on_drag_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_drag_release)
 
-        # Caught Canvas Drag Bindings
         self.caught_canvas.bind("<ButtonPress-1>", self.on_caught_drag_start)
         self.caught_canvas.bind("<B1-Motion>", self.on_caught_drag_motion)
         self.caught_canvas.bind("<ButtonRelease-1>", self.on_caught_drag_release)
 
-        # --- Control Panel Window ---
+        # Control Panel
         self.control_panel = tk.Toplevel(self.root)
         self.control_panel.title("Stream Control Panel")
         self.control_panel.geometry("450x980")
@@ -257,7 +466,6 @@ class OBSShinyTracker:
         self.create_control_panel()
         self.load_layout()
         
-        # Listeners
         self.encounters_var.trace_add("write", self.calculate_odds)
         self.base_odds_var.trace_add("write", self.calculate_odds)
         self.charm_var.trace_add("write", self.calculate_odds)
@@ -267,7 +475,6 @@ class OBSShinyTracker:
         self.size_counter.trace_add("write", lambda *args: self.refresh_text_styles())
         self.size_odds.trace_add("write", lambda *args: self.refresh_text_styles())
 
-        # Global Hotkey Listeners
         self.root.bind_all("<Key>", self.handle_global_key)
         self.root.bind_all("<Tab>", self.toggle_menu)
 
@@ -291,12 +498,15 @@ class OBSShinyTracker:
         if self.edit_mode:
             self.update_edit_boxes()
 
+    def get_game_sound_folders(self):
+        if not os.path.exists(SOUNDS_DIR):
+            os.makedirs(SOUNDS_DIR, exist_ok=True)
+        return [f for f in os.listdir(SOUNDS_DIR) if os.path.isdir(os.path.join(SOUNDS_DIR, f))]
+
     def create_control_panel(self):
-        # EDIT MODE TOGGLE
         self.edit_btn = ttk.Button(self.control_panel, text="🛠️ ENABLE EDIT / LAYOUT MODE", command=self.toggle_edit_mode)
         self.edit_btn.pack(fill="x", padx=10, pady=(10, 5))
 
-        # Setup Frame
         setup_frame = ttk.LabelFrame(self.control_panel, text="Hunt Setup & Caught Pokémon", padding=10)
         setup_frame.pack(fill="x", padx=10, pady=5)
         ttk.Label(setup_frame, text="Pokémon:").grid(row=0, column=0, pady=5)
@@ -304,7 +514,6 @@ class OBSShinyTracker:
         ttk.Button(setup_frame, text="Load", command=self.load_pokemon).grid(row=0, column=2, padx=5)
         
         ttk.Label(setup_frame, text="Game / Method:").grid(row=1, column=0, pady=5)
-        
         odds_presets = [
             "Gen 6+ (1/4096 Standard)",
             "Gen 1-5 (1/8192 Standard)",
@@ -314,24 +523,21 @@ class OBSShinyTracker:
             "Legends Arceus / Z-A: Outbreak/MMO"
         ]
         ttk.Combobox(setup_frame, textvariable=self.base_odds_var, values=odds_presets, state="readonly", width=20).grid(row=1, column=1, columnspan=2, sticky="w")
-        
         ttk.Button(setup_frame, text="✨ Register Current as Caught!", command=self.register_caught).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5,5))
         
-        # Caught Manager Frame inside Setup
         self.caught_mgr_frame = ttk.LabelFrame(setup_frame, text="Manage Caught Pokémon Visibility & Size", padding=5)
         self.caught_mgr_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
-        
         self.caught_checkboxes_container = ttk.Frame(self.caught_mgr_frame)
         self.caught_checkboxes_container.pack(fill="x")
 
-        # Size Controls Frame
+        # Size Frame
         size_frame = ttk.LabelFrame(self.control_panel, text="Element Sizes", padding=10)
         size_frame.pack(fill="x", padx=10, pady=5)
         self.make_slider(size_frame, "Sprite Size:", self.size_sprite, 120, 500, None)
         self.make_slider(size_frame, "Counter Size:", self.size_counter, 20, 150, None)
         self.make_slider(size_frame, "Odds Size:", self.size_odds, 10, 40, None)
 
-        # Controls & Hotkeys Frame
+        # Counter Controls
         ctrl_frame = ttk.LabelFrame(self.control_panel, text="Counter Controls & Custom Hotkeys", padding=10)
         ctrl_frame.pack(fill="x", padx=10, pady=5)
         
@@ -340,10 +546,8 @@ class OBSShinyTracker:
         ttk.Button(btn_row, text="-1", command=self.decrement, width=5).pack(side="left", padx=2)
         ttk.Button(btn_row, text="+1 Encounter", command=self.increment).pack(side="left", expand=True, fill="x", padx=2)
 
-        # Interactive Keybind Buttons Grid
         hk_grid = ttk.Frame(ctrl_frame)
         hk_grid.pack(fill="x", pady=(8,0))
-        
         ttk.Label(hk_grid, text="+1 Key:").grid(row=0, column=0, sticky="w", padx=2, pady=2)
         self.btn_inc_bind = ttk.Button(hk_grid, text=f"Key: {self.key_inc.get()}", command=lambda: self.start_key_capture('inc'))
         self.btn_inc_bind.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
@@ -355,24 +559,35 @@ class OBSShinyTracker:
         ttk.Label(hk_grid, text="Caught Key:").grid(row=2, column=0, sticky="w", padx=2, pady=2)
         self.btn_caught_bind = ttk.Button(hk_grid, text=f"Key: {self.key_caught.get()}", command=lambda: self.start_key_capture('caught'))
         self.btn_caught_bind.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
-        
         hk_grid.columnconfigure(1, weight=1)
 
-        # Auto-Tracker Frame
-        auto_frame = ttk.LabelFrame(self.control_panel, text="Auto-Tracker (Screen Scraping)", padding=10)
-        auto_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Button(auto_frame, text="🎯 Select Screen Region to Watch", command=self.open_region_selector).pack(fill="x", pady=2)
-        self.auto_toggle_btn = ttk.Button(auto_frame, text="Start Auto-Tracker", command=self.toggle_auto_tracker)
-        self.auto_toggle_btn.pack(fill="x", pady=2)
+        # --- Audio Auto-Tracker Frame ---
+        audio_frame = ttk.LabelFrame(self.control_panel, text="🎵 Audio Auto-Tracker (WASAPI Loopback)", padding=10)
+        audio_frame.pack(fill="x", padx=10, pady=5)
 
-        # Boosts Frame
+        ttk.Label(audio_frame, text="Game Sound Folder:").pack(anchor="w")
+        self.audio_combo = ttk.Combobox(audio_frame, textvariable=self.audio_game_var, values=self.get_game_sound_folders(), state="readonly")
+        self.audio_combo.pack(fill="x", pady=2)
+        self.audio_combo.bind("<<ComboboxSelected>>", self.on_audio_game_selected)
+
+        self.audio_toggle_btn = ttk.Button(audio_frame, text="Start Audio Auto-Tracker", command=self.toggle_audio_tracker)
+        self.audio_toggle_btn.pack(fill="x", pady=2)
+
+        # Screen Scraping Frame
+        screen_frame = ttk.LabelFrame(self.control_panel, text="👁️ Screen Auto-Tracker (Fallback)", padding=10)
+        screen_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Button(screen_frame, text="🎯 Select Screen Region to Watch", command=self.open_region_selector).pack(fill="x", pady=2)
+        self.screen_toggle_btn = ttk.Button(screen_frame, text="Start Screen Auto-Tracker", command=self.toggle_screen_tracker)
+        self.screen_toggle_btn.pack(fill="x", pady=2)
+
+        # Boosts
         boosts_frame = ttk.LabelFrame(self.control_panel, text="Active Boosts", padding=5)
         boosts_frame.pack(fill="x", padx=10, pady=5)
         ttk.Checkbutton(boosts_frame, text="Shiny Charm", variable=self.charm_var).pack(side="left", padx=5)
         ttk.Checkbutton(boosts_frame, text="Masuda", variable=self.masuda_var).pack(side="left", padx=5)
         ttk.Checkbutton(boosts_frame, text="Sandwich", variable=self.sandwich_var).pack(side="left", padx=5)
 
-        # Settings Frame
+        # Colors & Background
         settings_frame = ttk.LabelFrame(self.control_panel, text="Global Colors & Background", padding=10)
         settings_frame.pack(fill="x", padx=10, pady=5)
         btn_frame = ttk.Frame(settings_frame)
@@ -384,7 +599,7 @@ class OBSShinyTracker:
         self.transparent_bg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(settings_frame, text="Make Background 100% Invisible", variable=self.transparent_bg_var, command=self.update_transparency).pack(anchor="w", pady=(5,0))
 
-        # Alpha Frame
+        # Alpha Controls
         alpha_frame = ttk.LabelFrame(self.control_panel, text="Visibility Controls", padding=10)
         alpha_frame.pack(fill="x", padx=10, pady=5)
 
@@ -400,6 +615,37 @@ class OBSShinyTracker:
         self.make_slider(alpha_frame, "Counter Text:", self.alpha_counter, 0.0, 1.0, self.update_transparency)
         self.make_slider(alpha_frame, "Odds Text:", self.alpha_odds, 0.0, 1.0, self.update_transparency)
         self.make_slider(alpha_frame, "⚙️ Menu Button:", self.alpha_menu, 0.0, 1.0, self.update_transparency)
+
+    def on_audio_game_selected(self, event=None):
+        folder = self.audio_game_var.get()
+        count = self.audio_worker.load_game_templates(folder)
+        print(f"Loaded {count} .wav files for game profile: {folder}")
+        self.save_layout()
+
+    def toggle_audio_tracker(self):
+        if not self.audio_worker.is_running:
+            if self.audio_worker.start_loop():
+                self.audio_toggle_btn.config(text="Stop Audio Auto-Tracker (Running...)")
+        else:
+            self.audio_worker.stop_loop()
+            self.audio_toggle_btn.config(text="Start Audio Auto-Tracker")
+
+    def toggle_screen_tracker(self):
+        if not self.screen_worker.is_running:
+            self.screen_worker.start_loop()
+            self.screen_toggle_btn.config(text="Stop Screen Auto-Tracker (Running...)")
+        else:
+            self.screen_worker.stop_loop()
+            self.screen_toggle_btn.config(text="Start Screen Auto-Tracker")
+
+    def open_region_selector(self):
+        self.control_panel.withdraw()
+        RegionSelector(self.root, self.save_selected_region)
+
+    def save_selected_region(self, region):
+        self.control_panel.deiconify()
+        self.screen_worker.set_region(region)
+        messagebox.showinfo("Success", "Screen region set successfully!")
 
     def make_slider(self, parent, text, variable, from_val, to_val, command):
         frame = ttk.Frame(parent)
@@ -495,7 +741,6 @@ class OBSShinyTracker:
         elif key == self.key_caught.get().lower():
             self.register_caught()
 
-    # --- Caught Pokémon Registration & Spawning ---
     def register_caught(self):
         pokemon_name = self.pokemon_var.get().strip().lower()
         if not pokemon_name:
@@ -543,25 +788,6 @@ class OBSShinyTracker:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to register: {e}")
 
-    # --- Auto-Tracker Controls ---
-    def open_region_selector(self):
-        self.control_panel.withdraw()
-        RegionSelector(self.root, self.save_selected_region)
-
-    def save_selected_region(self, region):
-        self.control_panel.deiconify()
-        self.auto_worker.set_region(region)
-        messagebox.showinfo("Success", "Auto-tracker region set successfully!")
-
-    def toggle_auto_tracker(self):
-        if not self.auto_worker.is_running:
-            self.auto_worker.start_loop()
-            self.auto_toggle_btn.config(text="Stop Auto-Tracker (Running...)")
-        else:
-            self.auto_worker.stop_loop()
-            self.auto_toggle_btn.config(text="Start Auto-Tracker")
-
-    # --- Edit Mode & Window / Element Dragging / Resizing ---
     def toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode
         if self.edit_mode:
@@ -668,14 +894,14 @@ class OBSShinyTracker:
         if self.edit_mode:
             self.update_edit_boxes()
         self.drag_item = None
-        self.save_layout()  # Auto-save immediately upon releasing dragged elements
+        self.save_layout()
 
     def on_caught_drag_release(self, event):
         if hasattr(self, 'caught_drag_item'):
             self.caught_drag_item = None
         if self.edit_mode:
             self.update_edit_boxes()
-        self.save_layout()  # Auto-save immediately upon releasing caught elements
+        self.save_layout()
 
     def toggle_menu(self, event=None):
         if self.control_panel.winfo_ismapped():
@@ -683,10 +909,8 @@ class OBSShinyTracker:
         else:
             self.control_panel.deiconify()
 
-    # --- Advanced Game-Specific Odds Calculation Engine ---
     def calculate_odds(self, *args):
         selection = self.base_odds_var.get()
-        
         if "Dynamax Adventures + Charm" in selection:
             final_odds = 100
             display_text = f"Odds: 1/{final_odds} (Dynamax Adv.)"
@@ -696,7 +920,6 @@ class OBSShinyTracker:
         else:
             base = 8192 if "8192" in selection else 4096
             rolls = 1 
-            
             if self.charm_var.get(): rolls += 2
             if self.masuda_var.get(): rolls += 5 if base == 4096 else 4
             if self.sandwich_var.get(): rolls += 3
@@ -754,7 +977,6 @@ class OBSShinyTracker:
             if self.edit_mode: self.update_edit_boxes()
             self.save_layout()
 
-    # --- Rendering & Transparency Math ---
     def change_text_color(self):
         color = colorchooser.askcolor(title="Choose Text Color", initialcolor=self.text_color)[1]
         if color:
@@ -881,6 +1103,7 @@ class OBSShinyTracker:
                 "pokemon": self.pokemon_var.get(),
                 "encounters": self.encounters_var.get(),
                 "base_odds": self.base_odds_var.get(),
+                "audio_game": self.audio_game_var.get(),
                 "charm": self.charm_var.get(),
                 "masuda": self.masuda_var.get(),
                 "sandwich": self.sandwich_var.get()
@@ -918,20 +1141,15 @@ class OBSShinyTracker:
             json.dump(layout, f)
 
     def on_closing(self):
-        self.auto_worker.stop_loop()
+        self.screen_worker.stop_loop()
+        self.audio_worker.stop_loop()
         self.save_layout()
-        try:
-            self.root.destroy()
-        except:
-            pass
-        try:
-            self.caught_window.destroy()
-        except:
-            pass
-        try:
-            self.control_panel.destroy()
-        except:
-            pass
+        try: self.root.destroy()
+        except: pass
+        try: self.caught_window.destroy()
+        except: pass
+        try: self.control_panel.destroy()
+        except: pass
 
     def load_layout(self):
         if os.path.exists(LAYOUT_FILE):
@@ -943,14 +1161,17 @@ class OBSShinyTracker:
                     if geom:
                         self.root.geometry(geom)
 
-                    # Restore Hunt State
                     hunt_state = data.get("hunt_state", {})
                     self.pokemon_var.set(hunt_state.get("pokemon", ""))
                     self.encounters_var.set(hunt_state.get("encounters", 0))
                     self.base_odds_var.set(hunt_state.get("base_odds", "Gen 6+ (1/4096 Standard)"))
+                    self.audio_game_var.set(hunt_state.get("audio_game", ""))
                     self.charm_var.set(hunt_state.get("charm", False))
                     self.masuda_var.set(hunt_state.get("masuda", False))
                     self.sandwich_var.set(hunt_state.get("sandwich", False))
+
+                    if self.audio_game_var.get():
+                        self.audio_worker.load_game_templates(self.audio_game_var.get())
 
                     self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
                     self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
