@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, colorchooser, messagebox
+from tkinter import ttk, colorchooser, messagebox, filedialog
 import requests
 from io import BytesIO
 from PIL import Image, ImageTk
@@ -13,9 +13,6 @@ import cv2
 import pytesseract
 import re
 
-# Point Python to your specific Tesseract Engine path (using raw string 'r' to prevent escape errors)
-pytesseract.pytesseract.tesseract_cmd = r'C:\Users\joshu\AppData\Local\Tesseract-OCR\tesseract.exe'
-
 # Fix Windows High-DPI scaling
 try:
     import ctypes
@@ -24,6 +21,26 @@ except:
     pass
 
 LAYOUT_FILE = "vision_layout.json"
+
+# --- Smart Path Resolver ---
+def get_tesseract_path(saved_path=""):
+    """Checks common installation folders for Tesseract automatically."""
+    if saved_path and os.path.exists(saved_path):
+        return saved_path
+        
+    user_profile = os.environ.get('USERPROFILE', '')
+    common_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(user_profile, r"AppData\Local\Tesseract-OCR\tesseract.exe"),
+        os.path.join(user_profile, r"AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+            
+    return ""
 
 # --- Text & API Helper Functions ---
 def format_for_pokeapi(name):
@@ -216,6 +233,7 @@ class VisionShinyTracker:
         self.root.attributes("-topmost", True)
         
         # --- Variables ---
+        self.tesseract_path = ""
         self.pokemon_var = tk.StringVar()
         self.encounters_var = tk.IntVar(value=0)
         self.odds_var = tk.StringVar(value="Odds: 1/4096")
@@ -437,12 +455,28 @@ class VisionShinyTracker:
         self.make_slider(alpha_frame, "⚙️ Menu Button:", self.alpha_menu, 0.0, 1.0, self.update_transparency)
 
     def toggle_vision_tracker(self):
-        if not self.vision_worker.is_running:
-            if self.vision_worker.start_loop():
-                self.vision_toggle_btn.config(text="Stop Vision Auto-Tracker (Running...)")
-        else:
+        # 1. If stopping the tracker
+        if self.vision_worker.is_running:
             self.vision_worker.stop_loop()
             self.vision_toggle_btn.config(text="Start Vision Auto-Tracker")
+            return
+
+        # 2. If starting, ensure Tesseract is configured first
+        if not getattr(self, "tesseract_path", "") or not os.path.exists(self.tesseract_path):
+            messagebox.showinfo("Tesseract Required", "Tesseract-OCR was not found in the default Windows folders.\n\nPlease locate your 'tesseract.exe' file to enable the vision tracker.")
+            
+            # Pop open a file browser for the user to find it
+            file_path = filedialog.askopenfilename(title="Select tesseract.exe", filetypes=[("Executable", "*.exe")])
+            if file_path:
+                self.tesseract_path = file_path
+                self.save_layout() # Save it so we don't ask again
+            else:
+                return # User canceled the prompt, abort starting
+
+        # Set the path for the library and start the loop
+        pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+        if self.vision_worker.start_loop():
+            self.vision_toggle_btn.config(text="Stop Vision Auto-Tracker (Running...)")
 
     def open_region_selector(self):
         self.control_panel.withdraw()
@@ -912,6 +946,7 @@ class VisionShinyTracker:
             })
 
         layout = {
+            "tesseract_path": getattr(self, "tesseract_path", ""),
             "window_geometry": self.root.geometry(),
             "hunt_state": {
                 "pokemon": self.pokemon_var.get(),
@@ -968,6 +1003,10 @@ class VisionShinyTracker:
             try:
                 with open(LAYOUT_FILE, "r") as f:
                     data = json.load(f)
+                    
+                    # Load and verify Tesseract path automatically
+                    self.tesseract_path = data.get("tesseract_path", "")
+                    self.tesseract_path = get_tesseract_path(self.tesseract_path)
                     
                     geom = data.get("window_geometry")
                     if geom:
