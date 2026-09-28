@@ -66,11 +66,15 @@ def normalize_for_ocr(text):
 
 # --- Core Classes ---
 class RegionSelector:
-    """Interactive screen-crop tool with arrow-key precision nudging."""
+    """Interactive screen-crop tool with arrow-key precision nudging (Multi-Monitor Supported)."""
     def __init__(self, root, callback):
         self.callback = callback
         self.top = tk.Toplevel(root)
-        self.top.attributes("-fullscreen", True)
+        
+        # Multi-monitor window setup
+        self.top.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+        self.top.overrideredirect(True)
+        
         self.top.attributes("-alpha", 0.3)
         self.top.config(cursor="cross")
 
@@ -97,7 +101,8 @@ class RegionSelector:
         self.rect = None
 
         with mss.mss() as sct:
-            monitor = sct.monitors[1]
+            # [0] means All Monitors, allowing you to crop from secondary screens
+            monitor = sct.monitors[0] 
             sct_img = sct.grab(monitor)
             self.bg_image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
             self.bg_photo = ImageTk.PhotoImage(self.bg_image)
