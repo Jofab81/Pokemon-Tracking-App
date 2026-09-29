@@ -46,12 +46,12 @@ def get_tesseract_path(saved_path=""):
 def format_for_pokeapi(name):
     """Converts display names like 'Type: Null' or 'Mr. Mime' into clean API slugs."""
     name = name.strip().lower()
-    name = name.replace(":", "")     # 'Type: Null' -> 'type null'
-    name = name.replace("'", "")     # 'Farfetch'd' -> 'farfetchd'
-    name = name.replace(".", "")     # 'Mr. Mime' -> 'mr mime'
-    name = name.replace("♀", "-f")   # 'Nidoran♀' -> 'nidoran-f'
-    name = name.replace("♂", "-m")   # 'Nidoran♂' -> 'nidoran-m'
-    name = name.replace(" ", "-")    # Replaces spaces with hyphens
+    name = name.replace(":", "")     
+    name = name.replace("'", "")     
+    name = name.replace(".", "")     
+    name = name.replace("♀", "-f")   
+    name = name.replace("♂", "-m")   
+    name = name.replace(" ", "-")    
     
     while "--" in name:
         name = name.replace("--", "-")
@@ -61,7 +61,6 @@ def normalize_for_ocr(text):
     """Strips all spaces and punctuation so 'Type: Null' matches 'typenull' perfectly."""
     if not text:
         return ""
-    # Keep only lowercase letters and numbers (a-z, 0-9)
     return re.sub(r'[^a-z0-9]', '', text.lower())
 
 # --- Core Classes ---
@@ -71,7 +70,6 @@ class RegionSelector:
         self.callback = callback
         self.top = tk.Toplevel(root)
         
-        # Multi-monitor window setup
         self.top.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
         self.top.overrideredirect(True)
         
@@ -101,7 +99,6 @@ class RegionSelector:
         self.rect = None
 
         with mss.mss() as sct:
-            # [0] means All Monitors, allowing you to crop from secondary screens
             monitor = sct.monitors[0] 
             sct_img = sct.grab(monitor)
             self.bg_image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
@@ -165,15 +162,15 @@ class RegionSelector:
 
 
 class AdvancedVisionTrackerWorker:
-    """Pure OCR tracker featuring Otsu Thresholding, Normalization, and a Fade-to-Black State Machine."""
-    def __init__(self, callback_function, get_target_pokemon_function):
+    """Pure OCR tracker featuring Otsu Thresholding, Normalization, and Secondary Word Safeguards."""
+    def __init__(self, callback_function, get_target_pokemon_function, get_extra_word_function):
         self.is_running = False
         self.callback = callback_function
         self.get_target_pokemon = get_target_pokemon_function  
+        self.get_extra_word = get_extra_word_function
         self.thread = None
         self.region = {"top": 200, "left": 200, "width": 600, "height": 400}
         
-        # Replaces the time-based cooldown
         self.awaiting_black_screen = False 
 
     def set_region(self, region):
@@ -197,7 +194,6 @@ class AdvancedVisionTrackerWorker:
         with mss.mss() as sct:
             while self.is_running:
                 try:
-                    # 1. Grab target and strip its punctuation (e.g., "Type: Null" -> "typenull")
                     raw_target = self.get_target_pokemon()
                     target_clean = normalize_for_ocr(raw_target)
                     
@@ -205,41 +201,39 @@ class AdvancedVisionTrackerWorker:
                         time.sleep(1.0)
                         continue
 
-                    # 2. Capture screen region
                     sct_img = sct.grab(self.region)
                     live_img = np.array(sct_img)
                     live_gray = cv2.cvtColor(live_img, cv2.COLOR_BGRA2GRAY)
 
-                    # --- STATE MACHINE: Check for Black Screen Transition ---
                     if self.awaiting_black_screen:
-                        # A completely black screen has an average pixel intensity near 0.
-                        # We use 15 as a safe threshold to account for video compression artifacts.
                         if np.mean(live_gray) < 15:
                             print("🌑 Fade-to-Black detected! Unlocking counter for next encounter.")
                             self.awaiting_black_screen = False
                         time.sleep(0.5)
                         continue
 
-                    # 3. Apply Otsu's Thresholding to turn the image into crisp black & white
                     _, binary_img = cv2.threshold(live_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-                    # 4. Run Tesseract on the high-contrast image
                     raw_screen_text = pytesseract.image_to_string(binary_img, config='--psm 6')
-                    
-                    # 5. Strip punctuation from the screen text
                     screen_clean = normalize_for_ocr(raw_screen_text)
 
-                    # 6. Compare the stripped versions!
                     if target_clean in screen_clean:
+                        # --- NEW: Check for secondary context word (Dynamax Safeguard) ---
+                        require_extra, extra_word = self.get_extra_word()
+                        if require_extra:
+                            extra_clean = normalize_for_ocr(extra_word)
+                            # If they checked the box and wrote a word, ensure it's ALSO on the screen
+                            if extra_clean and extra_clean not in screen_clean:
+                                time.sleep(0.5)
+                                continue # Ignored! Context word missing!
+                        
                         print(f"🔥 TARGET MATCH! Found '{raw_target}' in text: '{raw_screen_text.strip()}'")
                         self.callback()  
-                        self.awaiting_black_screen = True  # Lock the counter until the game resets!
+                        self.awaiting_black_screen = True 
                         time.sleep(1.0) 
 
                 except Exception as e:
                     print(f"Vision loop error: {e}")
                 
-                # Scan twice a second to keep CPU load low
                 time.sleep(0.5)
 
 
@@ -259,6 +253,10 @@ class VisionShinyTracker:
         self.odds_var = tk.StringVar(value="Odds: 1/4096")
         self.base_odds_var = tk.StringVar(value="Gen 6+ (1/4096 Standard)")
         
+        # Dynamax Safeguard Variables
+        self.require_extra_word_var = tk.BooleanVar(value=False)
+        self.extra_word_var = tk.StringVar(value="take")
+
         # Size Controls
         self.size_sprite = tk.IntVar(value=120)
         self.size_counter = tk.IntVar(value=56)
@@ -298,7 +296,8 @@ class VisionShinyTracker:
         # --- Vision Worker Initialization ---
         self.vision_worker = AdvancedVisionTrackerWorker(
             callback_function=self.increment,
-            get_target_pokemon_function=lambda: self.pokemon_var.get()
+            get_target_pokemon_function=lambda: self.pokemon_var.get(),
+            get_extra_word_function=lambda: (self.require_extra_word_var.get(), self.extra_word_var.get())
         )
 
         # --- Canvas Engine ---
@@ -334,7 +333,7 @@ class VisionShinyTracker:
         # Control Panel
         self.control_panel = tk.Toplevel(self.root)
         self.control_panel.title("Vision Stream Control Panel")
-        self.control_panel.geometry("450x980")
+        self.control_panel.geometry("460x980")
         self.control_panel.protocol("WM_DELETE_WINDOW", self.on_closing) 
         
         self.create_control_panel()
@@ -373,29 +372,34 @@ class VisionShinyTracker:
             self.update_edit_boxes()
 
     def create_control_panel(self):
-        self.edit_btn = ttk.Button(self.control_panel, text="🛠️ ENABLE EDIT / LAYOUT MODE", command=self.toggle_edit_mode)
+        self.edit_btn = ttk.Button(self.control_panel, text="🛠️️ ENABLE EDIT / LAYOUT MODE", command=self.toggle_edit_mode)
         self.edit_btn.pack(fill="x", padx=10, pady=(10, 5))
 
         setup_frame = ttk.LabelFrame(self.control_panel, text="Hunt Setup & Caught Pokémon", padding=10)
         setup_frame.pack(fill="x", padx=10, pady=5)
+        
         ttk.Label(setup_frame, text="Pokémon:").grid(row=0, column=0, pady=5)
         ttk.Entry(setup_frame, textvariable=self.pokemon_var, width=15).grid(row=0, column=1, pady=5)
         ttk.Button(setup_frame, text="Load", command=self.load_pokemon).grid(row=0, column=2, padx=5)
         
         ttk.Label(setup_frame, text="Game / Method:").grid(row=1, column=0, pady=5)
         odds_presets = [
-            "Gen 6+ (1/4096 Standard)",
-            "Gen 1-5 (1/8192 Standard)",
-            "Dynamax Adventures (1/300)",
-            "Dynamax Adventures + Charm (1/100)",
-            "SV: Outbreak / Sandwich Hunt",
-            "Legends Arceus / Z-A: Outbreak/MMO"
+            "Gen 6+ (1/4096 Standard)", "Gen 1-5 (1/8192 Standard)",
+            "Dynamax Adventures (1/300)", "Dynamax Adventures + Charm (1/100)",
+            "SV: Outbreak / Sandwich Hunt", "Legends Arceus / Z-A: Outbreak/MMO"
         ]
         ttk.Combobox(setup_frame, textvariable=self.base_odds_var, values=odds_presets, state="readonly", width=20).grid(row=1, column=1, columnspan=2, sticky="w")
-        ttk.Button(setup_frame, text="✨ Register Current as Caught!", command=self.register_caught).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5,5))
+        
+        # --- NEW ADVANCED WORD REQUIREMENT ---
+        adv_frame = ttk.Frame(setup_frame)
+        adv_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=5)
+        ttk.Checkbutton(adv_frame, text="Require extra word (Dynamax Fix):", variable=self.require_extra_word_var).pack(side="left")
+        ttk.Entry(adv_frame, textvariable=self.extra_word_var, width=8).pack(side="left", padx=5)
+
+        ttk.Button(setup_frame, text="✨ Register Current as Caught!", command=self.register_caught).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(5,5))
         
         self.caught_mgr_frame = ttk.LabelFrame(setup_frame, text="Manage Caught Pokémon Visibility & Size", padding=5)
-        self.caught_mgr_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+        self.caught_mgr_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=5)
         self.caught_checkboxes_container = ttk.Frame(self.caught_mgr_frame)
         self.caught_checkboxes_container.pack(fill="x")
 
@@ -475,25 +479,20 @@ class VisionShinyTracker:
         self.make_slider(alpha_frame, "⚙️ Menu Button:", self.alpha_menu, 0.0, 1.0, self.update_transparency)
 
     def toggle_vision_tracker(self):
-        # 1. If stopping the tracker
         if self.vision_worker.is_running:
             self.vision_worker.stop_loop()
             self.vision_toggle_btn.config(text="Start Vision Auto-Tracker")
             return
 
-        # 2. If starting, ensure Tesseract is configured first
         if not getattr(self, "tesseract_path", "") or not os.path.exists(self.tesseract_path):
             messagebox.showinfo("Tesseract Required", "Tesseract-OCR was not found in the default Windows folders.\n\nPlease locate your 'tesseract.exe' file to enable the vision tracker.")
-            
-            # Pop open a file browser for the user to find it
             file_path = filedialog.askopenfilename(title="Select tesseract.exe", filetypes=[("Executable", "*.exe")])
             if file_path:
                 self.tesseract_path = file_path
-                self.save_layout() # Save it so we don't ask again
+                self.save_layout() 
             else:
-                return # User canceled the prompt, abort starting
+                return 
 
-        # Set the path for the library and start the loop
         pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
         if self.vision_worker.start_loop():
             self.vision_toggle_btn.config(text="Stop Vision Auto-Tracker (Running...)")
@@ -523,22 +522,10 @@ class VisionShinyTracker:
             row = ttk.Frame(self.caught_checkboxes_container)
             row.pack(fill="x", padx=2, pady=2)
             
-            cb = ttk.Checkbutton(
-                row,
-                text=c["name"].capitalize(),
-                variable=c["visible_var"],
-                command=lambda item=c: self.toggle_caught_visibility(item)
-            )
+            cb = ttk.Checkbutton(row, text=c["name"].capitalize(), variable=c["visible_var"], command=lambda item=c: self.toggle_caught_visibility(item))
             cb.pack(side="left", padx=2)
             
-            slider = ttk.Scale(
-                row,
-                from_=120,
-                to=500,
-                orient="horizontal",
-                variable=c["size_var"],
-                command=lambda val, item=c: self.update_caught_size(item, float(val))
-            )
+            slider = ttk.Scale(row, from_=120, to=500, orient="horizontal", variable=c["size_var"], command=lambda val, item=c: self.update_caught_size(item, float(val)))
             slider.pack(side="right", expand=True, fill="x", padx=5)
 
     def toggle_caught_visibility(self, item):
@@ -562,21 +549,14 @@ class VisionShinyTracker:
     def start_key_capture(self, action_type):
         self.capturing_action = action_type
         self.root.bind_all("<Key>", self.capture_key_press)
-        
-        if action_type == 'inc':
-            self.btn_inc_bind.config(text="Press any key...")
-        elif action_type == 'dec':
-            self.btn_dec_bind.config(text="Press any key...")
-        elif action_type == 'caught':
-            self.btn_caught_bind.config(text="Press any key...")
+        if action_type == 'inc': self.btn_inc_bind.config(text="Press any key...")
+        elif action_type == 'dec': self.btn_dec_bind.config(text="Press any key...")
+        elif action_type == 'caught': self.btn_caught_bind.config(text="Press any key...")
 
     def capture_key_press(self, event):
-        if event.keysym == "Tab":
-            return
-            
+        if event.keysym == "Tab": return
         if self.capturing_action:
             key_sym = event.keysym
-            
             if self.capturing_action == 'inc':
                 self.key_inc.set(key_sym)
                 self.btn_inc_bind.config(text=f"Key: {key_sym}")
@@ -586,30 +566,22 @@ class VisionShinyTracker:
             elif self.capturing_action == 'caught':
                 self.key_caught.set(key_sym)
                 self.btn_caught_bind.config(text=f"Key: {key_sym}")
-            
             self.capturing_action = None
             self.root.bind_all("<Key>", self.handle_global_key)
 
     def handle_global_key(self, event):
-        if isinstance(self.root.focus_get(), ttk.Entry):
-            return
-            
+        if isinstance(self.root.focus_get(), ttk.Entry): return
         key = event.keysym.lower()
-        if key == self.key_inc.get().lower():
-            self.increment()
-        elif key == self.key_dec.get().lower():
-            self.decrement()
-        elif key == self.key_caught.get().lower():
-            self.register_caught()
+        if key == self.key_inc.get().lower(): self.increment()
+        elif key == self.key_dec.get().lower(): self.decrement()
+        elif key == self.key_caught.get().lower(): self.register_caught()
 
     def register_caught(self):
         raw_pokemon = self.pokemon_var.get().strip()
         if not raw_pokemon:
             messagebox.showwarning("Warning", "Please enter a Pokémon name to register as caught!")
             return
-
         pokemon_slug = format_for_pokeapi(raw_pokemon)
-
         try:
             resp = requests.get(f"https://pokeapi.co/api/v2/pokemon/{pokemon_slug}")
             if resp.status_code == 200:
@@ -624,32 +596,23 @@ class VisionShinyTracker:
                     if not existing:
                         tag_base = f"caught_{len(self.caught_list)}_{int(time.time())}"
                         photo = ImageTk.PhotoImage(pil_img)
-                        
                         self.caught_canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=(tag_base, f"{tag_base}_box", "caught_edit_box"))
                         self.caught_canvas.create_image(400, 300, image=photo, tags=(tag_base, f"{tag_base}_main"))
-                        
                         vis_var = tk.BooleanVar(value=True)
                         size_var = tk.IntVar(value=default_size)
                         
                         self.caught_list.append({
-                            "name": pokemon_slug,
-                            "raw_image": raw_img,
-                            "photo": photo,
-                            "tag": tag_base,
-                            "visible_var": vis_var,
-                            "size_var": size_var
+                            "name": pokemon_slug, "raw_image": raw_img, "photo": photo,
+                            "tag": tag_base, "visible_var": vis_var, "size_var": size_var
                         })
                         self.rebuild_caught_manager_ui()
                         self.save_layout()
                         messagebox.showinfo("Success", f"Registered and spawned {raw_pokemon} on your full-screen overlay!")
                     else:
                         messagebox.showinfo("Info", f"{raw_pokemon} is already registered as caught!")
-                else:
-                    messagebox.showerror("Error", "No shiny sprite found.")
-            else:
-                messagebox.showerror("Error", "Pokémon not found.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to register: {e}")
+                else: messagebox.showerror("Error", "No shiny sprite found.")
+            else: messagebox.showerror("Error", "Pokémon not found.")
+        except Exception as e: messagebox.showerror("Error", f"Failed to register: {e}")
 
     def toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode
@@ -692,7 +655,6 @@ class VisionShinyTracker:
             return
             
         tags = self.canvas.gettags(items[0])
-        
         if self.edit_mode:
             if "drag_counter" in tags: self.drag_item = "drag_counter"
             elif "drag_odds" in tags: self.drag_item = "drag_odds"
@@ -710,8 +672,7 @@ class VisionShinyTracker:
         self.dragged = False
 
     def on_caught_drag_start(self, event):
-        if not self.edit_mode:
-            return
+        if not self.edit_mode: return
         items = self.caught_canvas.find_withtag("current")
         if not items:
             self.caught_drag_item = None
@@ -727,7 +688,6 @@ class VisionShinyTracker:
     def on_drag_motion(self, event):
         if not self.drag_item: return
         self.dragged = True
-        
         if self.drag_item == "window":
             dx = event.x_root - self.drag_start_x
             dy = event.y_root - self.drag_start_y
@@ -752,55 +712,38 @@ class VisionShinyTracker:
             self.caught_drag_start_y = event.y
 
     def on_drag_release(self, event):
-        if self.drag_item == "drag_menu" and not self.dragged:
-            self.toggle_menu()
-        if self.edit_mode:
-            self.update_edit_boxes()
+        if self.drag_item == "drag_menu" and not self.dragged: self.toggle_menu()
+        if self.edit_mode: self.update_edit_boxes()
         self.drag_item = None
         self.save_layout()
 
     def on_caught_drag_release(self, event):
-        if hasattr(self, 'caught_drag_item'):
-            self.caught_drag_item = None
-        if self.edit_mode:
-            self.update_edit_boxes()
+        if hasattr(self, 'caught_drag_item'): self.caught_drag_item = None
+        if self.edit_mode: self.update_edit_boxes()
         self.save_layout()
 
     def toggle_menu(self, event=None):
-        # Ignore Tab if the user is typing in a text box
-        if event and isinstance(self.root.focus_get(), ttk.Entry):
-            return
-            
-        if self.control_panel.winfo_ismapped():
-            self.control_panel.withdraw()
-        else:
-            self.control_panel.deiconify()
-            
+        if event and isinstance(self.root.focus_get(), ttk.Entry): return
+        if self.control_panel.winfo_ismapped(): self.control_panel.withdraw()
+        else: self.control_panel.deiconify()
         return "break"
 
     def calculate_odds(self, *args):
         selection = self.base_odds_var.get()
         if "Dynamax Adventures + Charm" in selection:
-            final_odds = 100
-            display_text = f"Odds: 1/{final_odds} (Dynamax Adv.)"
+            final_odds, display_text = 100, "Odds: 1/100 (Dynamax Adv.)"
         elif "Dynamax Adventures" in selection:
-            final_odds = 300
-            display_text = f"Odds: 1/{final_odds} (Dynamax Adv.)"
+            final_odds, display_text = 300, "Odds: 1/300 (Dynamax Adv.)"
         else:
             base = 8192 if "8192" in selection else 4096
             rolls = 1 
             if self.charm_var.get(): rolls += 2
             if self.masuda_var.get(): rolls += 5 if base == 4096 else 4
             if self.sandwich_var.get(): rolls += 3
-
-            if "SV: Outbreak" in selection:
-                rolls += 2 
-            elif "Legends Arceus" in selection:
-                rolls += 3 
-
+            if "SV: Outbreak" in selection: rolls += 2 
+            elif "Legends Arceus" in selection: rolls += 3 
             final_odds = max(1, base / rolls)
             display_text = f"Odds: {rolls}/{base} (1/{final_odds:.0f})"
-
         self.odds_var.set(display_text)
         self.canvas.itemconfig("drag_odds_main", text=self.odds_var.get())
         self.canvas.itemconfig("drag_odds_shadow", text=self.odds_var.get())
@@ -812,31 +755,23 @@ class VisionShinyTracker:
         if not raw_pokemon.strip(): 
             if not silent: messagebox.showwarning("Warning", "Please enter a Pokémon name.")
             return
-
-        # Format the name for PokéAPI compatibility (e.g., "Type: Null" -> "type-null")
         pokemon = format_for_pokeapi(raw_pokemon)
-
         try:
             response = requests.get(f"https://pokeapi.co/api/v2/pokemon/{pokemon}")
             if response.status_code == 200:
                 sprite_url = response.json()['sprites']['front_shiny']
                 if sprite_url:
                     img_resp = requests.get(sprite_url)
-                    # Store the raw, unresized image so the slider can scale it dynamically
                     self.base_pil_image = Image.open(BytesIO(img_resp.content))
                     self.update_transparency() 
                     if self.edit_mode: self.update_edit_boxes()
                     self.save_layout()
-                else:
-                    if not silent: messagebox.showerror("Error", "No shiny sprite found for this Pokémon.")
-            else:
-                if not silent: messagebox.showerror("Error", f"Pokémon '{raw_pokemon}' not found in API.")
+                elif not silent: messagebox.showerror("Error", "No shiny sprite found for this Pokémon.")
+            elif not silent: messagebox.showerror("Error", f"Pokémon '{raw_pokemon}' not found in API.")
         except Exception as e:
             if not silent: messagebox.showerror("Error", f"Failed to fetch data: {e}")
 
-    def increment(self): 
-        self.root.after(0, self._do_increment)
-        
+    def increment(self): self.root.after(0, self._do_increment)
     def _do_increment(self):
         self.encounters_var.set(self.encounters_var.get() + 1)
         self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
@@ -854,37 +789,22 @@ class VisionShinyTracker:
 
     def change_text_color(self):
         color = colorchooser.askcolor(title="Choose Text Color", initialcolor=self.text_color)[1]
-        if color:
-            self.text_color = color
-            self.update_transparency()
-            self.save_layout()
+        if color: self.text_color = color; self.update_transparency(); self.save_layout()
 
     def change_outline_color(self):
         color = colorchooser.askcolor(title="Choose Outline Color", initialcolor=self.outline_color)[1]
-        if color:
-            self.outline_color = color
-            self.update_transparency()
-            self.save_layout()
+        if color: self.outline_color = color; self.update_transparency(); self.save_layout()
 
     def change_bg_color(self):
         color = colorchooser.askcolor(title="Choose Background Color", initialcolor=self.bg_color)[1]
-        if color:
-            self.bg_color = color
-            self.update_transparency()
-            self.save_layout()
+        if color: self.bg_color = color; self.update_transparency(); self.save_layout()
 
     def blend_color(self, hex_fg, hex_bg, alpha):
         if alpha <= 0.01: return hex_bg 
         if alpha >= 0.99: return hex_fg 
-        
         r1, g1, b1 = int(hex_fg[1:3], 16), int(hex_fg[3:5], 16), int(hex_fg[5:7], 16)
         r2, g2, b2 = int(hex_bg[1:3], 16), int(hex_bg[3:5], 16), int(hex_bg[5:7], 16)
-        
-        r = int(r1 * alpha + r2 * (1 - alpha))
-        g = int(g1 * alpha + g2 * (1 - alpha))
-        b = int(b1 * alpha + b2 * (1 - alpha))
-        
-        return f"#{r:02x}{g:02x}{b:02x}"
+        return f"#{int(r1 * alpha + r2 * (1 - alpha)):02x}{int(g1 * alpha + g2 * (1 - alpha)):02x}{int(b1 * alpha + b2 * (1 - alpha)):02x}"
 
     def update_transparency(self, event=None):
         if self.edit_mode:
@@ -904,125 +824,69 @@ class VisionShinyTracker:
                 blend_bg = self.bg_color
             self.root.attributes("-alpha", self.alpha_window.get())
 
-        c_alpha = 1.0 if self.edit_mode else self.alpha_counter.get()
-        o_alpha = 1.0 if self.edit_mode else self.alpha_odds.get()
-        m_alpha = 1.0 if self.edit_mode else self.alpha_menu.get()
-        s_alpha = 1.0 if self.edit_mode else self.alpha_sprite.get()
+        c_alpha, o_alpha = (1.0, 1.0) if self.edit_mode else (self.alpha_counter.get(), self.alpha_odds.get())
+        m_alpha, s_alpha = (1.0, 1.0) if self.edit_mode else (self.alpha_menu.get(), self.alpha_sprite.get())
 
         if c_alpha <= 0.01:
-            self.canvas.itemconfig("drag_counter_main", state="hidden")
-            self.canvas.itemconfig("drag_counter_shadow", state="hidden")
+            self.canvas.itemconfig("drag_counter_main", state="hidden"); self.canvas.itemconfig("drag_counter_shadow", state="hidden")
         else:
             self.canvas.itemconfig("drag_counter_main", state="normal", fill=self.blend_color(self.text_color, blend_bg, c_alpha))
             self.canvas.itemconfig("drag_counter_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, c_alpha))
 
         if o_alpha <= 0.01:
-            self.canvas.itemconfig("drag_odds_main", state="hidden")
-            self.canvas.itemconfig("drag_odds_shadow", state="hidden")
+            self.canvas.itemconfig("drag_odds_main", state="hidden"); self.canvas.itemconfig("drag_odds_shadow", state="hidden")
         else:
             self.canvas.itemconfig("drag_odds_main", state="normal", fill=self.blend_color(self.text_color, blend_bg, o_alpha))
             self.canvas.itemconfig("drag_odds_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, o_alpha))
 
         if m_alpha <= 0.01:
-            self.canvas.itemconfig("drag_menu_main", state="hidden")
-            self.canvas.itemconfig("drag_menu_shadow", state="hidden")
+            self.canvas.itemconfig("drag_menu_main", state="hidden"); self.canvas.itemconfig("drag_menu_shadow", state="hidden")
         else:
             self.canvas.itemconfig("drag_menu_main", state="normal", fill=self.blend_color("#ffffff", blend_bg, m_alpha))
             self.canvas.itemconfig("drag_menu_shadow", state="normal", fill=self.blend_color(self.outline_color, blend_bg, m_alpha))
 
-        # Re-apply sprite rendering transparency AND scale dynamically
         if self.base_pil_image:
             if s_alpha <= 0.01:
                 self.canvas.itemconfig("drag_sprite_main", image="", state="hidden")
             else:
-                # 1. Grab the current size from the slider
                 current_size = self.size_sprite.get()
-                
-                # 2. Resize from the original raw image so it scales perfectly
                 img = self.base_pil_image.resize((current_size, current_size), Image.Resampling.NEAREST).convert("RGBA")
-                
-                # 3. Apply alpha blending
                 if s_alpha < 1.0:
                     r, g, b, a = img.split()
                     a = a.point(lambda p: int(p * s_alpha))
                     img = Image.merge("RGBA", (r, g, b, a))
-                    
                 self.current_sprite = ImageTk.PhotoImage(img)
                 self.canvas.itemconfig("drag_sprite_main", image=self.current_sprite, state="normal")
-                
-        # Ensure the layout boxes instantly update their size if we are in edit mode
-        if self.edit_mode:
-            self.update_edit_boxes()
+        if self.edit_mode: self.update_edit_boxes()
 
     def move_group_to(self, main_tag, group_tag, new_x, new_y):
         curr = self.canvas.coords(main_tag)
-        if curr and len(curr) >= 2:
-            dx = new_x - curr[0]
-            dy = new_y - curr[1]
-            self.canvas.move(group_tag, dx, dy)
+        if curr and len(curr) >= 2: self.canvas.move(group_tag, new_x - curr[0], new_y - curr[1])
 
     def save_layout(self):
         caught_data = []
         for c in self.caught_list:
-            coords = self.caught_canvas.coords(f"{c['tag']}_main")
-            caught_data.append({
-                "name": c["name"],
-                "coords": coords,
-                "visible": c["visible_var"].get(),
-                "size": c["size_var"].get()
-            })
-
+            caught_data.append({"name": c["name"], "coords": self.caught_canvas.coords(f"{c['tag']}_main"), "visible": c["visible_var"].get(), "size": c["size_var"].get()})
         layout = {
             "tesseract_path": getattr(self, "tesseract_path", ""),
             "window_geometry": self.root.geometry(),
             "hunt_state": {
-                "pokemon": self.pokemon_var.get(),
-                "encounters": self.encounters_var.get(),
-                "base_odds": self.base_odds_var.get(),
-                "charm": self.charm_var.get(),
-                "masuda": self.masuda_var.get(),
-                "sandwich": self.sandwich_var.get()
+                "pokemon": self.pokemon_var.get(), "encounters": self.encounters_var.get(), "base_odds": self.base_odds_var.get(),
+                "charm": self.charm_var.get(), "masuda": self.masuda_var.get(), "sandwich": self.sandwich_var.get(),
+                "require_extra": self.require_extra_word_var.get(), "extra_word": self.extra_word_var.get()
             },
-            "sizes": {
-                "sprite": self.size_sprite.get(),
-                "counter": self.size_counter.get(),
-                "odds": self.size_odds.get()
-            },
-            "coords": {
-                "sprite": self.canvas.coords("drag_sprite_main"),
-                "counter": self.canvas.coords("drag_counter_main"),
-                "odds": self.canvas.coords("drag_odds_main"),
-                "menu": self.canvas.coords("drag_menu_main")
-            },
+            "sizes": {"sprite": self.size_sprite.get(), "counter": self.size_counter.get(), "odds": self.size_odds.get()},
+            "coords": {"sprite": self.canvas.coords("drag_sprite_main"), "counter": self.canvas.coords("drag_counter_main"), "odds": self.canvas.coords("drag_odds_main"), "menu": self.canvas.coords("drag_menu_main")},
             "caught_sprites": caught_data,
-            "hotkeys": {
-                "inc": self.key_inc.get(),
-                "dec": self.key_dec.get(),
-                "caught": self.key_caught.get()
-            },
-            "text_color": self.text_color,
-            "outline_color": self.outline_color,
-            "bg_color": self.bg_color,
-            "transparent_bg": self.transparent_bg_var.get(),
-            "alphas": {
-                "window": self.alpha_window.get(),
-                "sprite": self.alpha_sprite.get(),
-                "counter": self.alpha_counter.get(),
-                "odds": self.alpha_odds.get(),
-                "menu": self.alpha_menu.get()
-            }
+            "hotkeys": {"inc": self.key_inc.get(), "dec": self.key_dec.get(), "caught": self.key_caught.get()},
+            "text_color": self.text_color, "outline_color": self.outline_color, "bg_color": self.bg_color, "transparent_bg": self.transparent_bg_var.get(),
+            "alphas": {"window": self.alpha_window.get(), "sprite": self.alpha_sprite.get(), "counter": self.alpha_counter.get(), "odds": self.alpha_odds.get(), "menu": self.alpha_menu.get()}
         }
-        with open(LAYOUT_FILE, "w") as f:
-            json.dump(layout, f)
+        with open(LAYOUT_FILE, "w") as f: json.dump(layout, f)
 
     def on_closing(self):
-        self.vision_worker.stop_loop()
-        self.save_layout()
-        try: self.root.destroy()
-        except: pass
-        try: self.caught_window.destroy()
-        except: pass
-        try: self.control_panel.destroy()
+        self.vision_worker.stop_loop(); self.save_layout()
+        try: self.root.destroy(); self.caught_window.destroy(); self.control_panel.destroy()
         except: pass
 
     def load_layout(self):
@@ -1030,59 +894,34 @@ class VisionShinyTracker:
             try:
                 with open(LAYOUT_FILE, "r") as f:
                     data = json.load(f)
-                    
-                    # Load and verify Tesseract path automatically
-                    self.tesseract_path = data.get("tesseract_path", "")
-                    self.tesseract_path = get_tesseract_path(self.tesseract_path)
-                    
-                    geom = data.get("window_geometry")
-                    if geom:
-                        self.root.geometry(geom)
+                    self.tesseract_path = get_tesseract_path(data.get("tesseract_path", ""))
+                    if geom := data.get("window_geometry"): self.root.geometry(geom)
 
                     hunt_state = data.get("hunt_state", {})
-                    self.pokemon_var.set(hunt_state.get("pokemon", ""))
-                    self.encounters_var.set(hunt_state.get("encounters", 0))
-                    self.base_odds_var.set(hunt_state.get("base_odds", "Gen 6+ (1/4096 Standard)"))
-                    self.charm_var.set(hunt_state.get("charm", False))
-                    self.masuda_var.set(hunt_state.get("masuda", False))
-                    self.sandwich_var.set(hunt_state.get("sandwich", False))
+                    self.pokemon_var.set(hunt_state.get("pokemon", "")); self.encounters_var.set(hunt_state.get("encounters", 0))
+                    self.base_odds_var.set(hunt_state.get("base_odds", "Gen 6+ (1/4096 Standard)")); self.charm_var.set(hunt_state.get("charm", False))
+                    self.masuda_var.set(hunt_state.get("masuda", False)); self.sandwich_var.set(hunt_state.get("sandwich", False))
+                    
+                    self.require_extra_word_var.set(hunt_state.get("require_extra", False))
+                    self.extra_word_var.set(hunt_state.get("extra_word", "take"))
 
-                    self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get()))
-                    self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
-
-                    if self.pokemon_var.get().strip():
-                        self.load_pokemon(silent=True)
+                    self.canvas.itemconfig("drag_counter_main", text=str(self.encounters_var.get())); self.canvas.itemconfig("drag_counter_shadow", text=str(self.encounters_var.get()))
+                    if self.pokemon_var.get().strip(): self.load_pokemon(silent=True)
 
                     sizes = data.get("sizes", {})
-                    self.size_sprite.set(sizes.get("sprite", 120))
-                    self.size_counter.set(sizes.get("counter", 56))
-                    self.size_odds.set(sizes.get("odds", 16))
+                    self.size_sprite.set(sizes.get("sprite", 120)); self.size_counter.set(sizes.get("counter", 56)); self.size_odds.set(sizes.get("odds", 16))
                     self.refresh_text_styles()
 
                     coords = data.get("coords", {})
-                    if "sprite" in coords and coords["sprite"]: 
-                        self.move_group_to("drag_sprite_main", "drag_sprite", *coords["sprite"])
-                    if "counter" in coords and coords["counter"]: 
-                        self.move_group_to("drag_counter_main", "drag_counter", *coords["counter"])
-                    if "odds" in coords and coords["odds"]: 
-                        self.move_group_to("drag_odds_main", "drag_odds", *coords["odds"])
-                    if "menu" in coords and coords["menu"]: 
-                        self.move_group_to("drag_menu_main", "drag_menu", *coords["menu"])
+                    for tag_key, tag_name in [("sprite", "drag_sprite"), ("counter", "drag_counter"), ("odds", "drag_odds"), ("menu", "drag_menu")]:
+                        if tag_key in coords and coords[tag_key]: self.move_group_to(f"{tag_name}_main", tag_name, *coords[tag_key])
                     
                     hotkeys = data.get("hotkeys", {})
-                    self.key_inc.set(hotkeys.get("inc", "space"))
-                    self.key_dec.set(hotkeys.get("dec", "Down"))
-                    self.key_caught.set(hotkeys.get("caught", "c"))
-                    
-                    self.btn_inc_bind.config(text=f"Key: {self.key_inc.get()}")
-                    self.btn_dec_bind.config(text=f"Key: {self.key_dec.get()}")
-                    self.btn_caught_bind.config(text=f"Key: {self.key_caught.get()}")
+                    self.key_inc.set(hotkeys.get("inc", "space")); self.key_dec.set(hotkeys.get("dec", "Down")); self.key_caught.set(hotkeys.get("caught", "c"))
+                    self.btn_inc_bind.config(text=f"Key: {self.key_inc.get()}"); self.btn_dec_bind.config(text=f"Key: {self.key_dec.get()}"); self.btn_caught_bind.config(text=f"Key: {self.key_caught.get()}")
 
                     for item in data.get("caught_sprites", []):
-                        name = item.get("name", "pokemon")
-                        c_coords = item.get("coords")
-                        visible = item.get("visible", True)
-                        saved_size = item.get("size", 120)
+                        name, c_coords, visible, saved_size = item.get("name", "pokemon"), item.get("coords"), item.get("visible", True), item.get("size", 120)
                         if c_coords and len(c_coords) >= 2:
                             try:
                                 resp = requests.get(f"https://pokeapi.co/api/v2/pokemon/{name.lower()}")
@@ -1091,45 +930,21 @@ class VisionShinyTracker:
                                     img_resp = requests.get(s_url)
                                     raw_img = Image.open(BytesIO(img_resp.content))
                                     pil_img = raw_img.resize((saved_size, saved_size), Image.Resampling.NEAREST)
-                                    
                                     tag_base = f"caught_{len(self.caught_list)}_{int(time.time())}"
                                     self.caught_canvas.create_rectangle(0, 0, 0, 0, fill="#555555", outline="#ffffff", width=2, state="hidden", tags=(tag_base, f"{tag_base}_box", "caught_edit_box"))
                                     photo = ImageTk.PhotoImage(pil_img)
-                                    state_str = "normal" if visible else "hidden"
-                                    self.caught_canvas.create_image(c_coords[0], c_coords[1], image=photo, state=state_str, tags=(tag_base, f"{tag_base}_main"))
-                                    
-                                    vis_var = tk.BooleanVar(value=visible)
-                                    size_var = tk.IntVar(value=saved_size)
-                                    
-                                    self.caught_list.append({
-                                        "name": name,
-                                        "raw_image": raw_img,
-                                        "photo": photo,
-                                        "tag": tag_base,
-                                        "visible_var": vis_var,
-                                        "size_var": size_var
-                                    })
-                            except:
-                                pass
+                                    self.caught_canvas.create_image(c_coords[0], c_coords[1], image=photo, state="normal" if visible else "hidden", tags=(tag_base, f"{tag_base}_main"))
+                                    self.caught_list.append({"name": name, "raw_image": raw_img, "photo": photo, "tag": tag_base, "visible_var": tk.BooleanVar(value=visible), "size_var": tk.IntVar(value=saved_size)})
+                            except: pass
                     self.rebuild_caught_manager_ui()
 
-                    self.text_color = data.get("text_color", "#ffffff")
-                    self.outline_color = data.get("outline_color", "#000000")
-                    self.bg_color = data.get("bg_color", "#00ff00")
-                    self.canvas.configure(bg=self.bg_color)
-
+                    self.text_color = data.get("text_color", "#ffffff"); self.outline_color = data.get("outline_color", "#000000"); self.bg_color = data.get("bg_color", "#00ff00")
                     self.transparent_bg_var.set(data.get("transparent_bg", False))
 
                     alphas = data.get("alphas", {})
-                    self.alpha_window.set(alphas.get("window", 1.0))
-                    self.alpha_sprite.set(alphas.get("sprite", 1.0))
-                    self.alpha_counter.set(alphas.get("counter", 1.0))
-                    self.alpha_odds.set(alphas.get("odds", 1.0))
-                    self.alpha_menu.set(alphas.get("menu", 1.0))
-                    
+                    self.alpha_window.set(alphas.get("window", 1.0)); self.alpha_sprite.set(alphas.get("sprite", 1.0)); self.alpha_counter.set(alphas.get("counter", 1.0)); self.alpha_odds.set(alphas.get("odds", 1.0)); self.alpha_menu.set(alphas.get("menu", 1.0))
                     self.update_transparency()
-            except:
-                pass
+            except: pass
 
 if __name__ == "__main__":
     root = tk.Tk()
