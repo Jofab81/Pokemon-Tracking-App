@@ -90,7 +90,7 @@ class RegionSelector:
         self.top.bind("<Up>", lambda e: self.move_box(0, -2))
         self.top.bind("<Down>", lambda e: self.move_box(0, 2))
         self.top.bind("<Return>", self.confirm_selection)
-        self.top.bind("<Escape>", lambda e: self.top.destroy())
+        self.top.bind("<Escape>", self.cancel_selection)
         
         self.top.focus_set()
 
@@ -140,9 +140,13 @@ class RegionSelector:
         self.current_y2 += dy
         self.canvas.coords(self.rect, self.start_x, self.start_y, self.current_x2, self.current_y2)
 
+    def cancel_selection(self, event=None):
+        self.callback(None)
+        self.top.destroy()
+
     def confirm_selection(self, event=None):
         if not self.rect:
-            self.top.destroy()
+            self.cancel_selection()
             return
             
         x1 = min(self.start_x, self.current_x2)
@@ -152,22 +156,25 @@ class RegionSelector:
         width = x2 - x1
         height = y2 - y1
         
-        region = {"top": y1, "left": x1, "width": width, "height": height}
-        self.top.destroy()
         if width > 10 and height > 10:
+            region = {"top": y1, "left": x1, "width": width, "height": height}
             self.callback(region)
+            self.top.destroy()
+        else:
+            self.cancel_selection()
 
 
 class AdvancedVisionTrackerWorker:
-    """Pure OCR text-scanning tracker featuring Otsu Thresholding and Text Normalization."""
+    """Pure OCR tracker featuring Otsu Thresholding, Normalization, and a Fade-to-Black State Machine."""
     def __init__(self, callback_function, get_target_pokemon_function):
         self.is_running = False
         self.callback = callback_function
         self.get_target_pokemon = get_target_pokemon_function  
         self.thread = None
         self.region = {"top": 200, "left": 200, "width": 600, "height": 400}
-        self.last_encounter_time = 0
-        self.lockout_duration = 10.0
+        
+        # Replaces the time-based cooldown
+        self.awaiting_black_screen = False 
 
     def set_region(self, region):
         if region:
@@ -203,6 +210,16 @@ class AdvancedVisionTrackerWorker:
                     live_img = np.array(sct_img)
                     live_gray = cv2.cvtColor(live_img, cv2.COLOR_BGRA2GRAY)
 
+                    # --- STATE MACHINE: Check for Black Screen Transition ---
+                    if self.awaiting_black_screen:
+                        # A completely black screen has an average pixel intensity near 0.
+                        # We use 15 as a safe threshold to account for video compression artifacts.
+                        if np.mean(live_gray) < 15:
+                            print("🌑 Fade-to-Black detected! Unlocking counter for next encounter.")
+                            self.awaiting_black_screen = False
+                        time.sleep(0.5)
+                        continue
+
                     # 3. Apply Otsu's Thresholding to turn the image into crisp black & white
                     _, binary_img = cv2.threshold(live_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -214,12 +231,10 @@ class AdvancedVisionTrackerWorker:
 
                     # 6. Compare the stripped versions!
                     if target_clean in screen_clean:
-                        current_time = time.time()
-                        if (current_time - self.last_encounter_time) > self.lockout_duration:
-                            print(f"🔥 TARGET MATCH! Found '{raw_target}' in text: '{raw_screen_text.strip()}'")
-                            self.callback()  
-                            self.last_encounter_time = current_time
-                            time.sleep(3.0) # Brief extra cooldown after a match
+                        print(f"🔥 TARGET MATCH! Found '{raw_target}' in text: '{raw_screen_text.strip()}'")
+                        self.callback()  
+                        self.awaiting_black_screen = True  # Lock the counter until the game resets!
+                        time.sleep(1.0) 
 
                 except Exception as e:
                     print(f"Vision loop error: {e}")
@@ -335,7 +350,7 @@ class VisionShinyTracker:
         self.size_odds.trace_add("write", lambda *args: self.refresh_text_styles())
 
         self.root.bind_all("<Key>", self.handle_global_key)
-        self.root.bind_all("<Tab>", self.toggle_menu)
+        self.root.bind_all("<KeyPress-Tab>", self.toggle_menu)
 
         self.control_panel.deiconify()
 
@@ -489,8 +504,9 @@ class VisionShinyTracker:
 
     def save_selected_region(self, region):
         self.control_panel.deiconify()
-        self.vision_worker.set_region(region)
-        messagebox.showinfo("Success", "Vision region set successfully!")
+        if region:
+            self.vision_worker.set_region(region)
+            messagebox.showinfo("Success", "Vision region set successfully!")
 
     def make_slider(self, parent, text, variable, from_val, to_val, command):
         frame = ttk.Frame(parent)
@@ -751,10 +767,16 @@ class VisionShinyTracker:
         self.save_layout()
 
     def toggle_menu(self, event=None):
+        # Ignore Tab if the user is typing in a text box
+        if event and isinstance(self.root.focus_get(), ttk.Entry):
+            return
+            
         if self.control_panel.winfo_ismapped():
             self.control_panel.withdraw()
         else:
             self.control_panel.deiconify()
+            
+        return "break"
 
     def calculate_odds(self, *args):
         selection = self.base_odds_var.get()
