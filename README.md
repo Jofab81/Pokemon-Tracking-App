@@ -19,7 +19,7 @@ Double-click the .exe to run it!
 Note: Windows might show a blue "Windows protected your PC" popup since these are unknown indie apps. Just click More Info -> Run Anyway.
 
 🛠️ The Trackers & How to Use Them
-👁️ 1. Ultimate Multi-Hunt Vision Tracker (obs_vision_tracker.exe)
+👁️ 1. Ultimate Multi-Hunt Vision Tracker (vision_tracker.exe)
 An advanced, automated OCR (Optical Character Recognition) tracker that watches your game screens or camera feeds and counts encounters by reading text. Now updated to support multiple simultaneous hunts across different games!
 
 Prerequisite: You MUST have Tesseract-OCR installed on your computer for this to work. The app will automatically try to find it, or ask you to locate tesseract.exe the first time you run it.
@@ -36,7 +36,7 @@ Repeat steps 1-3 for as many games/hunts as you are running.
 
 Click Start Vision Auto-Tracker. The app will quietly monitor all regions and independently increment your counters whenever a target Pokémon's name appears!
 
-🎧 2. Audio Tracker (obs_tracker.exe)
+🎧 2. Audio Tracker (Shiny_Tracker_Audio.zip)
 An automated tracker that runs in the background and listens to your system audio for the specific "shiny sparkle" sound effect.
 
 How to use:
@@ -49,7 +49,7 @@ Play your game normally. When the app hears the shiny sparkle sound effect throu
 
 ⚠️ Important Limitation: This tracker relies purely on wild encounter sound effects. It has not been configured to work with Egg hatches or Gift Pokémon! This is not a recommended version to use, as it's very buggy and not fully finished. This one is a discontinued project on here, but I'm leaving it up just in case anyone wants to use it.
 
-🖱️ 3. Manual Tracker (manual_tracker.exe)
+🖱️ 3. Manual Tracker (shiny_tracker.exe)
 The classic, reliable shiny tracker. Perfect for single hunts, soft resetting, or setups where audio/video automation isn't ideal.
 
 How to use:
