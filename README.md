@@ -1,4 +1,4 @@
-#🌟 Pokémon Shiny Tracker Suite
+🌟 Pokémon Shiny Tracker Suite
 A collection of lightweight, customizable, and automated overlay tools designed to make your shiny hunting streams cleaner and easier. Whether you are hunting a single target manually, listening for sparkles, or running multiple games simultaneously with screen-reading OCR, there is a tracker here tailored to your specific hunting style.
 
 All trackers feature a fully customizable transparent overlay. You can drag, drop, resize, and change the opacity of your Pokémon sprites, counters, and odds text directly on your screen!
